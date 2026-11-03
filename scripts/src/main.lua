@@ -213,6 +213,42 @@ end
 		"ocore_" .. _OPTIONS["osd"],
 	}
 
+	-- QEMU for the nextpi card, built by scripts/build-qemu.sh (make target qemu).
+	-- libqemu-mane.a is force-loaded so the linker keeps QEMU's machines and
+	-- devices, which register themselves from constructors. libqemu-mane-deps.a
+	-- holds QEMU's stubs and is linked normally. Each line of link-flags.txt is
+	-- one option, so "-framework X" stays together.
+	if _OPTIONS["targetos"]=="macosx" or _OPTIONS["targetos"]=="linux" then
+		local qemudir = MAME_DIR .. "build/qemu/"
+		local qemuflags = io.open(qemudir .. "link-flags.txt", "r")
+		if qemuflags == nil then
+			print("QEMU not built, " .. qemudir .. "link-flags.txt is missing (make qemu)")
+		else
+			if _OPTIONS["targetos"]=="macosx" then
+				linkoptions {
+					"-Wl,-force_load," .. qemudir .. "libqemu-mane.a",
+				}
+			else
+				linkoptions {
+					"-Wl,--whole-archive " .. qemudir .. "libqemu-mane.a -Wl,--no-whole-archive",
+				}
+			end
+			linkoptions {
+				qemudir .. "libqemu-mane-deps.a",
+			}
+			for line in qemuflags:lines() do
+				if line:sub(1, 2) == "-l" then
+					addlibfromstring(line)
+				elseif line ~= "" then
+					linkoptions {
+						line,
+					}
+				end
+			end
+			qemuflags:close()
+		end
+	end
+
 	override_resources = false;
 
 	maintargetosdoptions(_target, _subtarget)

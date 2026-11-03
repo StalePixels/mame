@@ -231,9 +231,19 @@ void specnext_uart_device::update_serial()
 	const parity_t parity = BIT(m_framing, 2) ? (BIT(m_framing, 1) ? PARITY_ODD : PARITY_EVEN) : PARITY_NONE;
 	set_data_frame(1, bits + 1, parity, BIT(m_framing, 0) ? STOP_BITS_2 : STOP_BITS_1);
 
-	const int rate = clock() / ((m_prescalar_msb << 14) | m_prescalar_lsb);
+	// Set the rate only when it changes: set_tra_rate() and set_rcv_rate()
+	// reset the shift registers, which cuts off the byte being sent.
+	const int rate = current_rate();
+	if (rate == m_rate)
+		return;
+	m_rate = rate;
 	set_tra_rate(rate);
 	set_rcv_rate(rate);
+}
+
+int specnext_uart_device::current_rate() const
+{
+	return clock() / ((m_prescalar_msb << 14) | m_prescalar_lsb);
 }
 
 bool specnext_uart_device::tx_blocked() const
@@ -278,6 +288,7 @@ void specnext_uart_device::device_start()
 	clear_fifo();
 	clear_rx_fifo();
 
+	m_rate = 0;
 	update_serial();
 	m_out_txd_cb(1);
 
@@ -294,6 +305,12 @@ void specnext_uart_device::device_start()
 	save_item(NAME(m_rx_overflow));
 	save_item(NAME(m_cts_n));
 	save_item(NAME(m_tx_bit_sent));
+}
+
+void specnext_uart_device::device_post_load()
+{
+	// The serial interface saves its own rates; keep m_rate in step with them.
+	m_rate = current_rate();
 }
 
 void specnext_uart_device::device_reset()

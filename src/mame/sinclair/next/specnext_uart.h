@@ -27,6 +27,7 @@ public:
 protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
+	virtual void device_post_load() override;
 
 	virtual void tra_callback() override;
 	virtual void tra_complete() override;
@@ -51,12 +52,14 @@ private:
 	bool m_rx_overflow;
 	bool m_cts_n;      // 0 = clear to send
 	bool m_tx_bit_sent;
+	int m_rate; // last rate given to set_tra_rate() and set_rcv_rate()
 
 	u8 dat_r();
 	u8 status_reg_r();
 	void clear_rx_fifo();
 	void rx_fifo_push();
 	void update_serial();
+	int current_rate() const;
 	bool tx_blocked() const;
 	void tx_resume();
 	void txd_idle_w();

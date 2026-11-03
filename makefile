@@ -1522,7 +1522,23 @@ $(GEN_FOLDERS):
 
 genie: $(GENIE)
 
+# QEMU for the nextpi card: scripts/build-qemu.sh builds it into build/qemu.
+# GENie reads build/qemu/link-flags.txt, so the project Makefiles wait for it.
+ifneq ($(filter linux macosx,$(TARGETOS)),)
+QEMU_TARGET := qemu
+
+.PHONY: qemu
+qemu:
+	$(SILENT) bash scripts/build-qemu.sh
+
+$(PROJECTDIR)/$(MAKETYPE)-linux/Makefile \
+$(PROJECTDIR)/$(MAKETYPE)-linux-clang/Makefile \
+$(PROJECTDIR)/$(MAKETYPE)-osx/Makefile \
+$(PROJECTDIR)/$(MAKETYPE)-osx-clang/Makefile: | qemu
+endif
+
 generate: \
+		$(QEMU_TARGET) \
 		genie \
 		$(GEN_FOLDERS) \
 		$(GENDIR)/version.cpp \

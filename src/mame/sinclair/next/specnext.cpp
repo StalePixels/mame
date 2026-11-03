@@ -37,6 +37,7 @@
 #include "bus/midi/midi.h"
 #include "bus/rs232/rs232.h"
 #include "bus/rs232/esp8266_at.h"
+#include "bus/rs232/nextpi.h"
 #include "bus/rs232/null_modem.h"
 #include "bus/rs232/pty.h"
 #include "bus/spectrum/zxbus/bus.h"
@@ -4214,6 +4215,9 @@ DEVICE_INPUT_DEFAULTS_END
 static void rs232_devices(device_slot_interface &device)
 {
 	device.option_add("esp8266_at", ESP8266_AT);
+#if !defined(_WIN32)
+	device.option_add("nextpi",     NEXTPI);
+#endif
 	device.option_add("null_modem", NULL_MODEM);
 	device.option_add("pty",        PSEUDO_TERMINAL);
 }
@@ -4291,7 +4295,11 @@ void specnext_state::tbblue(machine_config &config)
 	m_uart[1]->out_rx_full_near_callback().set(m_im2_uart1_rx, FUNC(specnext_im2_device::irq_w));
 	m_uart[1]->out_tx_empty_callback().set(m_im2_uart1_tx, FUNC(specnext_im2_device::irq_w));
 	m_uart[1]->out_rts_callback().set("rs232_rpi", FUNC(rs232_port_device::write_rts));
+#if !defined(_WIN32)
+	rs232_port_device &rs232_rpi(RS232_PORT(config, "rs232_rpi", rs232_devices, "nextpi"));
+#else
 	rs232_port_device &rs232_rpi(RS232_PORT(config, "rs232_rpi", rs232_devices, nullptr));
+#endif
 	rs232_rpi.rxd_handler().set(m_uart[1], FUNC(specnext_uart_device::rx_w));
 	rs232_rpi.cts_handler().set(m_uart[1], FUNC(specnext_uart_device::cts_w));
 	rs232_rpi.set_option_device_input_defaults("null_modem", DEVICE_INPUT_DEFAULTS_NAME(rs232_baud));
