@@ -33,7 +33,7 @@ function maintargetosdoptions(_target,_subtarget)
 
 	-- nothing inside MAME calls the C interface, so name each function
 	-- to keep the linker from leaving pinesymain.o out of the archive
-	for _, fn in ipairs({ "run", "request_exit", "key", "char", "machine_count", "machine_name", "machine_description" }) do
+	for _, fn in ipairs({ "run", "request_exit", "key", "char", "list_machines", "describe" }) do
 		linkoptions {
 			"-Wl,-u,_pinesy_" .. fn,
 		}
@@ -151,6 +151,12 @@ project ("osd_" .. _OPTIONS["osd"])
 		MAME_DIR .. "src/osd/pinesy/pinesy.h",
 		MAME_DIR .. "src/osd/pinesy/pinesymain.cpp",
 		MAME_DIR .. "src/osd/pinesy/hostview.mm",
+		MAME_DIR .. "src/osd/pinesy/pinesyinfo.cpp",
+	}
+
+	-- pinesyinfo.cpp reads the ini files as the frontend does
+	includedirs {
+		MAME_DIR .. "src/frontend/mame",
 	}
 
 

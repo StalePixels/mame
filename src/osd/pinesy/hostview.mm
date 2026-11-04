@@ -10,8 +10,9 @@
 //  functions for a host application that owns every window:
 //  the first MAME window draws on the NSView the host passes
 //  to pinesy_run(), and MAME creates no window of its own.
-//  Window geometry, fullscreen and the pointer belong to the
-//  host, so those calls do nothing here.
+//  The window shape MAME asks for goes to the host; window
+//  order, fullscreen and the pointer belong to the host, so
+//  those calls do nothing here.
 //
 //============================================================
 
@@ -37,17 +38,20 @@ struct host_surface
 	int height;
 };
 
-pinesy_host s_host = { nullptr, nullptr, nullptr };
+pinesy_host s_host = {};
 bool s_view_in_use = false;
 
 } // anonymous namespace
+
+// in pinesymain.cpp
+void pinesy_retry_exit();
 
 void pinesy_attach_host(const pinesy_host *host)
 {
 	if (host != nullptr)
 		s_host = *host;
 	else
-		s_host = pinesy_host{ nullptr, nullptr, nullptr };
+		s_host = pinesy_host{};
 	s_view_in_use = false;
 }
 
@@ -60,6 +64,10 @@ void *CreateMAMEWindow(const char *title, int x, int y, int w, int h, bool isFul
 	{
 		surface->view = [(NSView *)s_host.view retain];
 		s_view_in_use = true;
+
+		// the host sizes its window as MAME would size its own
+		if (s_host.size != nullptr)
+			s_host.size(s_host.context, w, h);
 	}
 
 	return surface;
@@ -189,6 +197,8 @@ void MacPollInputs()
 	}
 
 	[NSApp updateWindows];
+
+	pinesy_retry_exit();
 }
 
 bool MacAppHasFocus()
@@ -242,13 +252,28 @@ bool MacGetDisplayWorkArea(uint32_t displayID, int *x, int *y, int *width, int *
 
 
 //============================================================
-//  owned by the host: window geometry, fullscreen, pointer
+//  window shape: passed to the host for the view's window
+//============================================================
+
+void MacSetWindowAspectRatio(void *wincontroller, int width, int height)
+{
+	if ((((host_surface *)wincontroller)->view != nil) && (s_host.aspect != nullptr))
+		s_host.aspect(s_host.context, width, height);
+}
+
+void MacSetWindowContentSize(void *wincontroller, int width, int height)
+{
+	if ((((host_surface *)wincontroller)->view != nil) && (s_host.size != nullptr))
+		s_host.size(s_host.context, width, height);
+}
+
+
+//============================================================
+//  owned by the host: window order, fullscreen, pointer
 //============================================================
 
 void MacOrderWindowFront(void *wincontroller) { }
-void MacSetWindowAspectRatio(void *wincontroller, int width, int height) { }
 void MacSetWindowMinSize(void *wincontroller, int width, int height) { }
-void MacSetWindowContentSize(void *wincontroller, int width, int height) { }
 void MacSetFullscreen(void *wincontroller, bool fullscreen, uint32_t displayID) { }
 void MacShowPointer(bool show) { }
 void MacCapturePointer(void *wincontroller, bool capture) { }

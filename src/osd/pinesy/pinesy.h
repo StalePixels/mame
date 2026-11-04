@@ -24,6 +24,16 @@ extern "C" {
 // during the call. May be null.
 typedef void (*pinesy_frame_fn)(void *context, const void *pixels, int width, int height, int pitch);
 
+// Receives one complete UTF-8 JSON document. Valid only during the call.
+typedef void (*pinesy_text_fn)(void *context, const char *text);
+
+// Receives one line of MAME output. channel is MAME's osd_output_channel:
+// 0 error, 1 warning, 2 info, 3 debug, 4 verbose, 5 log.
+typedef void (*pinesy_output_fn)(void *context, int channel, const char *text);
+
+// Receives a size for the host's window, in points.
+typedef void (*pinesy_size_fn)(void *context, int width, int height);
+
 typedef struct pinesy_host
 {
 	// NSView that shows the first screen. MAME renders at the view's
@@ -33,6 +43,19 @@ typedef struct pinesy_host
 	void *view;
 
 	pinesy_frame_fn frame;
+
+	// Receives MAME's output while it runs. May be null. MAME still
+	// prints the output as it does without a host.
+	pinesy_output_fn output;
+
+	// The shape MAME wants for the view: aspect gets the ratio to keep
+	// when the user resizes (0, 0: any shape), size the view's size.
+	// MAME calls size with its own window size when it takes the view,
+	// and again when the view's shape does not fit the picture. Either
+	// may be null.
+	pinesy_size_fn aspect;
+	pinesy_size_fn size;
+
 	void *context;
 } pinesy_host;
 
@@ -42,7 +65,9 @@ typedef struct pinesy_host
 // host may be null.
 int pinesy_run(int argc, const char *const argv[], const pinesy_host *host);
 
-// Asks the running machine to exit. Returns 1 if a machine is running.
+// Asks the running machine to exit. Returns 1 while pinesy_run() runs.
+// A request made before the machine has started is kept, and the
+// machine exits as soon as it has.
 int pinesy_request_exit(void);
 
 // Keyboard input. keycode is a macOS virtual key code (NSEvent
@@ -52,11 +77,25 @@ void pinesy_key(int keycode, int down);
 // Typed characters, for text entry in MAME's own menus.
 void pinesy_char(unsigned int ch);
 
-// The machines built into this library. index runs from 0 to
-// pinesy_machine_count() - 1. The strings are static.
-int pinesy_machine_count(void);
-const char *pinesy_machine_name(int index);
-const char *pinesy_machine_description(int index);
+// Every driver in the library, as one JSON array. Each driver has
+// name, description, manufacturer, year, cloneof (or null),
+// sourcefile, unofficial, status (good, imperfect or preliminary,
+// as in -listxml), biossets, devices (the sorted device type names
+// of the default configuration, without the driver itself) and
+// slots (as pinesy_describe gives them, for the default
+// configuration). A driver MAME cannot describe is left out.
+// Returns 0.
+int pinesy_list_machines(pinesy_text_fn fn, void *context);
+
+// The machine a command line describes, as one JSON object. argv is
+// a command line as pinesy_run() takes it: a driver, then options.
+// MAME parses it as for a run (ini files are read only when the
+// command line allows it) and builds the machine configuration
+// without starting it. The object has driver, bios, biossets, slots
+// and media; errors, with MAME's error text; and warnings, with
+// MAME's warning text, which do not stop a run. Both are empty when
+// there is none. Returns 0, or MAME's error code.
+int pinesy_describe(int argc, const char *const argv[], pinesy_text_fn fn, void *context);
 
 #ifdef __cplusplus
 }
