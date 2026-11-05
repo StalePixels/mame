@@ -36,7 +36,13 @@ if [ ! -f "$SRC/configure" ]; then
 	exit 1
 fi
 
-COMMIT=$(git -C "$SRC" rev-parse HEAD)
+# A copy of the tree without git (as a Flatpak build gets) has no commit;
+# its stamp is "unversioned".
+if [ -e "$SRC/.git" ]; then
+	COMMIT=$(git -C "$SRC" rev-parse HEAD)
+else
+	COMMIT=unversioned
+fi
 if [ -f "$STAMP" ] && [ -f "$LIB" ] && [ -f "$DEPS" ] && [ -f "$FLAGS" ] &&
    [ "$(cat "$STAMP")" = "$COMMIT" ]; then
 	exit 0
@@ -47,7 +53,14 @@ mkdir -p "$OUT"
 cd "$OUT"
 
 if [ ! -f build.ninja ]; then
+	# on Linux the objects go into libmame_pinesy.so, so they must be PIC
+	extra=()
+	case "$(uname -s)" in
+		Darwin) ;;
+		*) extra=(--extra-cflags=-fPIC --disable-pie) ;;
+	esac
 	"$SRC/configure" \
+		"${extra[@]}" \
 		--target-list=arm-softmmu \
 		--without-default-features \
 		--disable-docs \
@@ -62,9 +75,21 @@ if ninja -t targets all | grep -q '^qemu-system-arm-unsigned:'; then
 	TARGET=qemu-system-arm-unsigned
 fi
 
-ninja qemu-system-arm
-
+# The link may go through a response file (cc @qemu-system-arm.rsp, as
+# meson writes it on Linux). Ninja deletes that file unless asked to keep
+# it, so relink once if it is missing.
+ninja -d keeprsp qemu-system-arm
 LINE=$(ninja -t commands "$TARGET" | tail -n 1)
+case "$LINE" in
+	*" @"*)
+		RSP=${LINE##* @}
+		if [ ! -f "$RSP" ]; then
+			rm -f "$TARGET"
+			ninja -d keeprsp qemu-system-arm
+		fi
+		LINE="${LINE% @*} $(cat "$RSP")"
+		;;
+esac
 
 OBJS=()
 LIBS=()
