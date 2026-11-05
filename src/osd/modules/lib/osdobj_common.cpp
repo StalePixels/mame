@@ -285,6 +285,9 @@ void osd_common_t::register_options()
 #ifndef OSD_MINI
 	REGISTER_MODULE(m_mod_man, DEBUG_WINDOWS);
 	REGISTER_MODULE(m_mod_man, DEBUG_QT);
+#ifdef PINESY_DEBUG_GTK
+	REGISTER_MODULE(m_mod_man, DEBUG_GTK);
+#endif
 	REGISTER_MODULE(m_mod_man, DEBUG_IMGUI);
 	REGISTER_MODULE(m_mod_man, DEBUG_GDBSTUB);
 	REGISTER_MODULE(m_mod_man, DEBUG_NONE);
