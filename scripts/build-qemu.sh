@@ -1,15 +1,15 @@
 #!/bin/bash
 # license:BSD-3-Clause
 #
-# Build QEMU (../qemu, next to this MAME tree) as one static archive for the MaNE binary.
+# Build QEMU (../qemu, next to this MAME tree) as one static archive for the Pinesy binary.
 #
 # Configures QEMU out of tree in build/qemu, builds qemu-system-arm, and
 # turns its link command into:
-#   build/qemu/libqemu-mane.a    every object of qemu-system-arm except
+#   build/qemu/libqemu-pinesy.a  every object of qemu-system-arm except
 #                                system/main.c; linked force-loaded, so the
 #                                linker keeps QEMU's constructor-registered
 #                                machines and devices
-#   build/qemu/libqemu-mane-deps.a  the static libraries from the same link
+#   build/qemu/libqemu-pinesy-deps.a  the static libraries from the same link
 #                                (libqemuutil.a, libfdt.a), linked normally;
 #                                libqemuutil.a holds QEMU's stubs, which
 #                                clash with the real code if force-loaded
@@ -26,8 +26,8 @@ set -f
 MAME_DIR=$(cd "$(dirname "$0")/.." && pwd)
 SRC=$MAME_DIR/../qemu
 OUT=$MAME_DIR/build/qemu
-LIB=$OUT/libqemu-mane.a
-DEPS=$OUT/libqemu-mane-deps.a
+LIB=$OUT/libqemu-pinesy.a
+DEPS=$OUT/libqemu-pinesy-deps.a
 FLAGS=$OUT/link-flags.txt
 STAMP=$OUT/stamp
 

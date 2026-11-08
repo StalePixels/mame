@@ -4,10 +4,10 @@
 
     Read-only FAT32 reader for the nextpi card
 
-    Reads one file from the root folder of a FAT32 file system, matching
-    long or short names without regard to case.  Only what the card needs
-    to take the kernel, device tree and command line from the Pi's boot
-    partition.
+    Reads one file from a FAT32 file system.  The path names folders with
+    '/', and each part matches a long or short name without regard to
+    case.  Only what the card needs to take the boot files, device trees
+    and overlays from the Pi's boot partition.
 
 ***************************************************************************/
 
@@ -87,16 +87,38 @@ public:
 		return std::string();
 	}
 
-	bool find(std::string_view name, u32 &cluster, u32 &size)
+	// Find a file by path; a leading '/' and empty parts are ignored
+	bool find(std::string_view path, u32 &cluster, u32 &size)
 	{
-		std::vector<u8> root;
-		if (!read_chain(m_root_cluster, ~u32(0), root))
+		u32 folder = m_root_cluster;
+		while (true)
+		{
+			size_t const first = path.find_first_not_of('/');
+			if (first == std::string_view::npos)
+				return false;
+			path.remove_prefix(first);
+			size_t const split = path.find('/');
+			std::string_view const name = path.substr(0, split);
+			bool const last = (split == std::string_view::npos) || (path.find_first_not_of('/', split) == std::string_view::npos);
+			if (!find_entry(folder, name, !last, cluster, size))
+				return false;
+			if (last)
+				return true;
+			folder = cluster ? cluster : m_root_cluster; // ".." of a folder in the root
+			path.remove_prefix(split);
+		}
+	}
+
+	bool find_entry(u32 folder, std::string_view name, bool want_folder, u32 &cluster, u32 &size)
+	{
+		std::vector<u8> entries;
+		if (!read_chain(folder, ~u32(0), entries))
 			return false;
 
 		std::u16string lfn;
-		for (size_t pos = 0; (pos + 32) <= root.size(); pos += 32)
+		for (size_t pos = 0; (pos + 32) <= entries.size(); pos += 32)
 		{
-			u8 const *const entry = &root[pos];
+			u8 const *const entry = &entries[pos];
 			if (entry[0] == 0x00)
 				break;
 			if (entry[0] == 0xe5)
@@ -118,9 +140,9 @@ public:
 				}
 				continue;
 			}
-			if (entry[11] & 0x18)
+			if ((entry[11] & 0x08) || (bool(entry[11] & 0x10) != want_folder))
 			{
-				// folder or volume label
+				// volume label, or not the kind of entry wanted
 				lfn.clear();
 				continue;
 			}
@@ -189,7 +211,7 @@ private:
 } // anonymous namespace
 
 
-std::string nextpi_fat32_read(util::random_read &image, u64 offset, std::string_view name, std::vector<u8> &data)
+std::string nextpi_fat32_read(util::random_read &image, u64 offset, std::string_view path, std::vector<u8> &data)
 {
 	fat32_volume volume(image, offset);
 	std::string err = volume.mount();
@@ -197,14 +219,22 @@ std::string nextpi_fat32_read(util::random_read &image, u64 offset, std::string_
 		return err;
 
 	u32 cluster, size;
-	if (!volume.find(name, cluster, size))
-		return util::string_format("%s not found in the boot partition", name);
+	if (!volume.find(path, cluster, size))
+		return util::string_format("%s not found in the boot partition", path);
 	if (!size)
 	{
 		data.clear();
 		return std::string();
 	}
 	if (!volume.read_chain(cluster, size, data))
-		return util::string_format("cannot read %s from the boot partition", name);
+		return util::string_format("cannot read %s from the boot partition", path);
 	return std::string();
+}
+
+
+bool nextpi_fat32_exists(util::random_read &image, u64 offset, std::string_view path)
+{
+	fat32_volume volume(image, offset);
+	u32 cluster, size;
+	return volume.mount().empty() && volume.find(path, cluster, size);
 }
