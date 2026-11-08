@@ -24,6 +24,13 @@ public:
 	// Core 3.03.03 changed the Z80N: it adds NEXTREG A,n (ED C7)
 	void core_30303_w(bool data) { m_core_30303 = data; }
 
+	// T80N debug interface (FPGA cpu/readme.txt): one byte of CPU state by
+	// register id 0x00-0x1f.  debug_reg_r only reads, so another thread may
+	// call it; it then sees the state at some point of the running
+	// instruction.  debug_reg_w is for the emulation thread only.
+	u8 debug_reg_r(u8 reg);
+	void debug_reg_w(u8 reg, u8 data);
+
 protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;

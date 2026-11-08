@@ -17,6 +17,10 @@ public:
 	void ctrl_int_w(u8 ch_mask);
 	u8 ctrl_int_r();
 
+	// An interrupt request on a channel whether its interrupt is enabled
+	// or not: the core's unqualified request (im2_peripheral.vhd i_int_unq)
+	void int_unq_w(int ch) { channel_int_request(ch); }
+
 	int z80daisy_chanel_irq_state(int ch) { return channel_int_state(ch); }
 
 protected:

@@ -22,6 +22,12 @@
     them in emulated time.  Next audio to the Pi (PCM_DIN) is not
     emulated.
 
+    The Pi's SPI0 chip select 0 (/dev/spidev0.0) goes to the host
+    through device_pi_spi_interface.  QEMU gives the card each batch of
+    bytes on its own thread; the card passes it to the host there, and
+    answers QEMU before it returns, so the Pi never waits for the
+    emulation thread.
+
     QEMU can only be started once per process.  It keeps running through
     hard resets and stops when the process exits.  Pi state is not part
     of save states.
@@ -78,6 +84,11 @@ constexpr unsigned IN_HIGH_WATER = 4096;
 // I2S frames between QEMU's thread and the emulation: a power of 2
 constexpr u32 I2S_RING = 1 << 14;
 
+// Most bytes QEMU gives in one SPI transfer call (include/pinesy/bridge.h)
+constexpr u32 SPI_BATCH_MAX = 64;
+
+class nextpi_device;
+
 class nextpi_qemu
 {
 public:
@@ -121,6 +132,16 @@ public:
 	}
 	void i2s_skip(u32 frames) { m_i2s_tail.fetch_add(frames, std::memory_order_release); }
 
+	// The card that answers SPI.  Detaching waits until QEMU's thread has
+	// left the card, so the card can go away afterwards.
+	void spi_attach(nextpi_device *device) { m_spi_device.store(device); }
+	void spi_detach()
+	{
+		m_spi_device.store(nullptr);
+		while (m_spi_busy.load())
+			std::this_thread::yield();
+	}
+
 private:
 	// QEMU's main loop thread, with QEMU's lock held.  A full ring drops
 	// the frame: the emulation has stopped taking them.
@@ -134,6 +155,13 @@ private:
 		qemu.m_i2s_ring[head & (I2S_RING - 1)] = { sample[0], sample[1] };
 		qemu.m_i2s_head.store(head + 1, std::memory_order_release);
 	}
+
+	// QEMU's thread, with QEMU's lock held
+	static void spi_select(void *opaque, bool selected);
+	static void spi_transfer(void *opaque, uint8_t const *mosi, uint32_t length);
+
+	std::atomic<nextpi_device *> m_spi_device = nullptr;
+	std::atomic<int> m_spi_busy = 0;
 
 	std::array<std::array<s32, 2>, I2S_RING> m_i2s_ring;
 	std::atomic<u32> m_i2s_head = 0;
@@ -546,6 +574,8 @@ std::string nextpi_qemu::start(std::string const &image, std::vector<u8> const &
 			{
 				PinesyI2SHandlers const handlers = { &nextpi_qemu::i2s_tx, nullptr };
 				pinesy_bridge_set_i2s(&handlers, this);
+				PinesySPIHandlers const spi_handlers = { &nextpi_qemu::spi_select, &nextpi_qemu::spi_transfer };
+				pinesy_bridge_set_spi(&spi_handlers, this);
 				pinesy_bridge_run(int(m_argv.size() - 1), m_argv.data());
 				m_done = true;
 			});
@@ -553,7 +583,7 @@ std::string nextpi_qemu::start(std::string const &image, std::vector<u8> const &
 }
 
 
-class nextpi_device : public buffered_rs232_device<16>, public device_image_interface, public device_pi_i2s_interface
+class nextpi_device : public buffered_rs232_device<16>, public device_image_interface, public device_pi_i2s_interface, public device_pi_spi_interface
 {
 public:
 	nextpi_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock);
@@ -561,6 +591,18 @@ public:
 	static constexpr flags_type emulation_flags() { return flags::SAVE_UNSUPPORTED; }
 
 	void update_serial(int state);
+
+	// QEMU's thread
+	void spi_select(bool selected)
+	{
+		if (!m_spi_select.isnull())
+			m_spi_select(selected ? 1 : 0);
+	}
+	void spi_transfer(u8 const *mosi, u8 *miso, u32 length)
+	{
+		if (!m_spi_transfer.isnull())
+			m_spi_transfer(mosi, miso, length);
+	}
 
 	// device_image_interface
 	virtual std::pair<std::error_condition, std::string> call_load() override;
@@ -578,6 +620,7 @@ protected:
 	virtual ioport_constructor device_input_ports() const override ATTR_COLD;
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
+	virtual void device_stop() override ATTR_COLD;
 
 	virtual void tra_complete() override;
 	virtual void received_byte(u8 byte) override;
@@ -608,6 +651,7 @@ nextpi_device::nextpi_device(machine_config const &mconfig, char const *tag, dev
 	: buffered_rs232_device<16>(mconfig, NEXTPI, tag, owner, clock)
 	, device_image_interface(mconfig, *this)
 	, device_pi_i2s_interface(mconfig, *this)
+	, device_pi_spi_interface(mconfig, *this)
 	, m_baud_config(*this, "RS232_BAUD")
 	, m_poll_timer(nullptr)
 	, m_i2s_timer(nullptr)
@@ -645,6 +689,43 @@ void nextpi_device::device_reset()
 
 	if (m_fd >= 0)
 		m_poll_timer->adjust(attotime::from_msec(1), 0, attotime::from_msec(1));
+
+	// The host sets its SPI handlers when it starts, before the first reset
+	s_qemu.spi_attach(this);
+}
+
+
+void nextpi_device::device_stop()
+{
+	s_qemu.spi_detach();
+}
+
+
+void nextpi_qemu::spi_select(void *opaque, bool selected)
+{
+	nextpi_qemu &qemu = *reinterpret_cast<nextpi_qemu *>(opaque);
+	qemu.m_spi_busy.fetch_add(1);
+	nextpi_device *const device = qemu.m_spi_device.load();
+	if (device)
+		device->spi_select(selected);
+	qemu.m_spi_busy.fetch_sub(1);
+}
+
+
+// The answer goes back before QEMU's register access returns.  With no
+// card, or a host without the SPI interface, MISO reads 0xff.
+void nextpi_qemu::spi_transfer(void *opaque, uint8_t const *mosi, uint32_t length)
+{
+	nextpi_qemu &qemu = *reinterpret_cast<nextpi_qemu *>(opaque);
+	std::array<u8, SPI_BATCH_MAX> miso;
+	miso.fill(0xff);
+	length = std::min<uint32_t>(length, SPI_BATCH_MAX);
+	qemu.m_spi_busy.fetch_add(1);
+	nextpi_device *const device = qemu.m_spi_device.load();
+	if (device)
+		device->spi_transfer(mosi, miso.data(), length);
+	qemu.m_spi_busy.fetch_sub(1);
+	pinesy_bridge_spi_reply(miso.data(), length);
 }
 
 
