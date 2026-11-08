@@ -136,10 +136,12 @@ public:
 		, m_i2c(*this, "i2c")
 		, m_uart(*this, "uart%u", 0U)
 		, m_rs232_esp(*this, "rs232_esp")
+		, m_rs232_rpi(*this, "rs232_rpi")
 		, m_midi_out(*this, "mdout")
 		, m_sdcards(*this, "sdcard%u", 0U)
 		, m_ay(*this, "ay%u", 0U)
 		, m_dac(*this, "dac%u", 0U)
+		, m_pi_dac(*this, "pi_dac%u", 0U)
 		, m_palette(*this, "palette")
 		, m_regs_map(*this, "regs_map")
 		, m_mf(*this, "multiface")
@@ -232,6 +234,16 @@ private:
 	TIMER_CALLBACK_MEMBER(spi_clock);
 	void line_irq_adjust();
 	void irq_w(int state);
+	void pi_i2s_frame_w(s32 left, s32 right);
+	void pi_i2s_update();
+	void pi_i2s_2d_update();
+	u16 pi_audio_l() const;
+	u16 pi_audio_r() const;
+	u8 port_fe_r(offs_t offset);
+	void port_fe_w(offs_t offset, u8 data);
+	bool ear_sig();
+	void ear_update(bool clk_en);
+	TIMER_CALLBACK_MEMBER(ear_relax_clk);
 
 	u8 g_machine_id() { return m_machine_id; }
 	u8 g_board_issue() { return m_board_issue; }
@@ -387,10 +399,12 @@ private:
 	optional_device_array<specnext_uart_device, 2> m_uart;
 	optional_device<rs232_port_device> m_rs232_esp;
 	device_esp8266_rst_interface *m_esp_rst = nullptr;
+	optional_device<rs232_port_device> m_rs232_rpi;
 	optional_device<midi_port_device> m_midi_out;
 	required_device_array<spi_sdcard_device, 2> m_sdcards;
 	required_device_array<ym2149_device, 3> m_ay;
 	required_device_array<dac_byte_interface, 4> m_dac;
+	required_device_array<dac_word_interface, 2> m_pi_dac;
 	required_device<device_palette_interface> m_palette;
 	required_device<address_map_bank_device> m_regs_map;
 	required_device<specnext_multiface_device> m_mf;
@@ -581,6 +595,12 @@ private:
 	u8 m_nr_9b_pi_gpio_o; // u4
 	u8 m_nr_a0_pi_peripheral_en;
 	u8 m_nr_a2_pi_i2s_ctl;
+	u16 m_pi_i2s_audio_l; // u10, unsigned, silence 0x200
+	u16 m_pi_i2s_audio_r; // u10
+	bool m_pi_fe_ear;
+	bool m_ear_sig;
+	u8 m_ear_relax_counter; // u7
+	bool m_audio_ear;
 	bool m_nr_a8_esp_gpio0_en;
 	bool m_nr_a9_esp_gpio0;
 	u8 m_nr_b8_divmmc_ep_0;
@@ -641,6 +661,7 @@ private:
 
 	emu_timer *m_irq_line_timer;
 	emu_timer *m_spi_clock;
+	emu_timer *m_ear_relax_timer;
 	int m_spi_clock_cycles;
 	bool m_spi_clock_state;
 	u8 m_spi_mosi_dat;
@@ -1791,15 +1812,15 @@ u8 specnext_state::reg_r(offs_t nr_register)
 		port_253b_dat = m_nr_stored_palette_value;
 		break;
 	case 0x2c:
-		port_253b_dat = 0;//pi_audio_L(9 downto 2);
-		//m_nr_2d_i2s_sample = pi_audio_L(1 downto 0);
+		port_253b_dat = BIT(pi_audio_l(), 2, 8);
+		m_nr_2d_i2s_sample = BIT(pi_audio_l(), 0, 2);
 		break;
 	case 0x2d:
 		port_253b_dat = (m_nr_2d_i2s_sample << 6) | 0b000000;
 		break;
 	case 0x2e:
-		port_253b_dat = 0;//pi_audio_R(9 downto 2);
-		//m_nr_2d_i2s_sample = pi_audio_R(1 downto 0);
+		port_253b_dat = BIT(pi_audio_r(), 2, 8);
+		m_nr_2d_i2s_sample = BIT(pi_audio_r(), 0, 2);
 		break;
 	case 0x2f:
 		port_253b_dat = (0b000000 << 2) | BIT(m_nr_30_tm_scrollx, 8, 2);
@@ -2160,6 +2181,7 @@ void specnext_state::reg_w(offs_t nr_wr_reg, u8 nr_wr_dat)
 		if (m_nr_03_config_mode == 1)
 			m_nr_06_ps2_mode = BIT(nr_wr_dat, 2);
 		m_nr_06_psg_mode = BIT(nr_wr_dat, 0, 2);
+		ear_update(false);
 		break;
 	case 0x07:
 		nr_07_cpu_speed_w(BIT(nr_wr_dat, 0, 2));
@@ -2173,6 +2195,7 @@ void specnext_state::reg_w(offs_t nr_wr_reg, u8 nr_wr_dat)
 		m_nr_08_port_ff_rd_en = BIT(nr_wr_dat, 2);
 		m_nr_08_psg_turbosound_en = BIT(nr_wr_dat, 1);
 		m_nr_08_keyboard_issue2 = BIT(nr_wr_dat, 0);
+		ear_update(false);
 
 		if (BIT(nr_wr_dat, 7))
 			port_7ffd_reg_w(m_port_7ffd_data &= ~0x20);
@@ -2648,6 +2671,13 @@ void specnext_state::reg_w(offs_t nr_wr_reg, u8 nr_wr_dat)
 		break;
 	case 0xa2:
 		m_nr_a2_pi_i2s_ctl = nr_wr_dat;
+		if (!BIT(m_nr_a2_pi_i2s_ctl, 6, 2))
+		{
+			// I2S block held in reset
+			m_pi_i2s_audio_l = 0x200;
+			m_pi_i2s_audio_r = 0x200;
+		}
+		pi_i2s_update();
 		break;
 	case 0xa8:
 		m_nr_a8_esp_gpio0_en = BIT(nr_wr_dat, 0);
@@ -2809,6 +2839,117 @@ static const z80_daisy_config z80_daisy_chain[] =
 	{ "im2_uart1_tx" },
 	{ nullptr }
 };
+
+// One frame from the Pi's I2S output.  The Next keeps the top 10 bits of
+// each sample and inverts the sign bit.  NextReg 0xA2 bit 4 = 0 reads data
+// on GPIO 20, the Pi's PCM_DIN, which nothing drives here: taken as all
+// zero bits, so silence.
+void specnext_state::pi_i2s_frame_w(s32 left, s32 right)
+{
+	if (!BIT(m_nr_a2_pi_i2s_ctl, 6, 2))
+		return;
+
+	const bool data_in = BIT(m_nr_a2_pi_i2s_ctl, 4);
+	m_pi_i2s_audio_l = data_in ? (BIT(left, 22, 10) ^ 0x200) : 0x200;
+	m_pi_i2s_audio_r = data_in ? (BIT(right, 22, 10) ^ 0x200) : 0x200;
+	pi_i2s_update();
+}
+
+u16 specnext_state::pi_audio_l() const
+{
+	if (!BIT(m_nr_a2_pi_i2s_ctl, 6, 2) || BIT(m_nr_a2_pi_i2s_ctl, 3) || BIT(m_nr_a2_pi_i2s_ctl, 0))
+		return 0x200;
+	return BIT(m_nr_a2_pi_i2s_ctl, 7) ? m_pi_i2s_audio_l : m_pi_i2s_audio_r;
+}
+
+u16 specnext_state::pi_audio_r() const
+{
+	if (!BIT(m_nr_a2_pi_i2s_ctl, 6, 2) || BIT(m_nr_a2_pi_i2s_ctl, 2) || BIT(m_nr_a2_pi_i2s_ctl, 0))
+		return 0x200;
+	return BIT(m_nr_a2_pi_i2s_ctl, 6) ? m_pi_i2s_audio_r : m_pi_i2s_audio_l;
+}
+
+void specnext_state::pi_i2s_update()
+{
+	m_pi_dac[0]->data_w(pi_audio_l());
+	m_pi_dac[1]->data_w(pi_audio_r());
+
+	// EAR mode: 1-bit Pi audio with hysteresis, from the samples before routing and mutes
+	const u8 threshold = BIT(m_pi_i2s_audio_l, 8, 2) | BIT(m_pi_i2s_audio_r, 8, 2);
+	const bool pi_fe_ear = m_pi_fe_ear;
+	if (!BIT(m_nr_a2_pi_i2s_ctl, 6, 2) || !BIT(m_nr_a2_pi_i2s_ctl, 0) || (threshold == 0b00))
+		m_pi_fe_ear = false;
+	else if (threshold == 0b11)
+		m_pi_fe_ear = true;
+	if (m_pi_fe_ear != pi_fe_ear)
+		ear_update(false);
+
+	pi_i2s_2d_update();
+}
+
+// The FPGA refreshes the 0x2D low bits on every clock while 0x2C or 0x2E
+// is selected, not only on a read
+void specnext_state::pi_i2s_2d_update()
+{
+	if (m_nr_register == 0x2c)
+		m_nr_2d_i2s_sample = BIT(pi_audio_l(), 0, 2);
+	else if (m_nr_register == 0x2e)
+		m_nr_2d_i2s_sample = BIT(pi_audio_r(), 0, 2);
+}
+
+// The board's EAR input: the tape input XOR the Pi's EAR bit, through a
+// filter that relaxes a level held for 64 membrane clock enables (about
+// 1.15 ms) to the issue 2 MIC bit.  The result is the core's i_AUDIO_EAR.
+// The tape input is inverted on the board, so silence (input 0) reads 1.
+// Not emulated: the noise filter on the tape input, which only rejects
+// pulses shorter than about 1.14 us.
+bool specnext_state::ear_sig()
+{
+	const bool ear_port_i = m_cassette->input() <= 0.0038;
+	return ear_port_i ^ !m_pi_fe_ear ^ 1; // INVERT
+}
+
+// clk_en: a membrane clock enable.  Changes are seen at once on a port 0xfe
+// read or a Pi EAR change, otherwise at the next clock enable.
+void specnext_state::ear_update(bool clk_en)
+{
+	const bool sig = ear_sig();
+	if (sig != m_ear_sig)
+	{
+		m_ear_sig = sig;
+		m_ear_relax_counter = 0;
+	}
+	else if (clk_en && !BIT(m_ear_relax_counter, 6))
+		m_ear_relax_counter++;
+
+	const bool port_fe_mic = BIT(m_port_fe_data, 3);
+	const bool issue2_fe_mic = port_fe_mic && m_nr_08_keyboard_issue2;
+	m_audio_ear = BIT(m_ear_relax_counter, 6) ? issue2_fe_mic : sig;
+
+	// Mixer: EAR is the beeper (port 0xfe bit 4) at 512, MIC is the tape and
+	// Pi input with the MIC bit at 128; the internal speaker mode silences both
+	const bool beep_mic_final = m_audio_ear ^ issue2_fe_mic ^ port_fe_mic;
+	const bool beep_spkr_excl = m_nr_06_internal_speaker_beep && m_nr_08_internal_speaker_en;
+	m_speaker->level_w(beep_spkr_excl ? 0 : ((BIT(m_port_fe_data, 4) << 1) | beep_mic_final));
+}
+
+TIMER_CALLBACK_MEMBER(specnext_state::ear_relax_clk)
+{
+	ear_update(true);
+}
+
+u8 specnext_state::port_fe_r(offs_t offset)
+{
+	ear_update(false);
+	const bool port_fe_ear = BIT(m_port_fe_data, 4);
+	return (spectrum_ula_r(offset) & ~0x40) | ((m_audio_ear || port_fe_ear) << 6);
+}
+
+void specnext_state::port_fe_w(offs_t offset, u8 data)
+{
+	spectrum_ula_w(offset, data);
+	ear_update(false);
+}
 
 TIMER_CALLBACK_MEMBER(specnext_state::irq_off)
 {
@@ -3160,7 +3301,7 @@ void specnext_state::map_io(address_map &map)
 	map.unmap_value_high();
 	map(0x0000, 0xffff).unmaprw();
 
-	map(0x0000, 0x0000).select(0xfffe).rw(FUNC(specnext_state::spectrum_ula_r), FUNC(specnext_state::spectrum_ula_w));
+	map(0x0000, 0x0000).select(0xfffe).rw(FUNC(specnext_state::port_fe_r), FUNC(specnext_state::port_fe_w));
 	map(0x00ff, 0x00ff).mirror(0xff00).rw(FUNC(specnext_state::port_ff_r), FUNC(specnext_state::port_ff_w));
 
 	map(0x001f, 0x001f).select(0xff00).rw(FUNC(specnext_state::mf_port_r<0x1f>), FUNC(specnext_state::mf_port_w<0x1f>));
@@ -3334,7 +3475,7 @@ void specnext_state::map_io(address_map &map)
 	map(0x153b, 0x153b).rw(FUNC(specnext_state::uart_reg_r<1>), FUNC(specnext_state::uart_reg_w<1>));
 	map(0x163b, 0x163b).rw(FUNC(specnext_state::uart_reg_r<2>), FUNC(specnext_state::uart_reg_w<2>));
 	map(0x243b, 0x243b).lrw8(NAME([this]() { return m_nr_register; })
-		, NAME([this](u8 data) { m_nr_register = data; }));
+		, NAME([this](u8 data) { m_nr_register = data; pi_i2s_2d_update(); }));
 	map(0x253b, 0x253b).lrw8(NAME([this]() { return m_next_regs.read_byte(m_nr_register); })
 		, NAME([this](u8 data) { m_next_regs.write_byte(m_nr_register, data); }));
 	map(0x303b, 0x303b).lrw8(NAME([this]() {
@@ -3505,6 +3646,13 @@ void specnext_state::machine_start()
 	m_irq_line_timer = timer_alloc(FUNC(specnext_state::line_irq_on), this);
 	m_spi_clock = timer_alloc(FUNC(specnext_state::spi_clock), this);
 
+	// The relaxation filter has no reset: it starts at power on only
+	m_ear_sig = true;
+	m_ear_relax_counter = 0;
+	m_audio_ear = false;
+	m_ear_relax_timer = timer_alloc(FUNC(specnext_state::ear_relax_clk), this);
+	m_ear_relax_timer->adjust(attotime::from_ticks(512, 28_MHz_XTAL), 0, attotime::from_ticks(512, 28_MHz_XTAL));
+
 	m_regs_map->space(AS_PROGRAM).specific(m_next_regs);
 
 	for (int addr = 0; addr < m_ram->size(); ++addr)
@@ -3514,6 +3662,12 @@ void specnext_state::machine_start()
 
 	if (m_rs232_esp)
 		m_esp_rst = dynamic_cast<device_esp8266_rst_interface *>(m_rs232_esp->get_card_device());
+	if (m_rs232_rpi)
+	{
+		auto *const pi_i2s = dynamic_cast<device_pi_i2s_interface *>(m_rs232_rpi->get_card_device());
+		if (pi_i2s)
+			pi_i2s->set_i2s_frame_handler(device_pi_i2s_interface::frame_delegate(FUNC(specnext_state::pi_i2s_frame_w), this));
+	}
 	for (auto i = 0; i < 8; i++)
 		m_bank_ram[i]->configure_entries(0, m_ram->size() / 0x2000, m_ram->pointer(), 0x2000);
 	m_bank_boot_rom->configure_entries(0, 2, memregion("maincpu")->base(), 0x2000);
@@ -3693,6 +3847,12 @@ void specnext_state::machine_start()
 	save_item(NAME(m_nr_9b_pi_gpio_o));
 	save_item(NAME(m_nr_a0_pi_peripheral_en));
 	save_item(NAME(m_nr_a2_pi_i2s_ctl));
+	save_item(NAME(m_pi_i2s_audio_l));
+	save_item(NAME(m_pi_i2s_audio_r));
+	save_item(NAME(m_pi_fe_ear));
+	save_item(NAME(m_ear_sig));
+	save_item(NAME(m_ear_relax_counter));
+	save_item(NAME(m_audio_ear));
 	save_item(NAME(m_nr_a8_esp_gpio0_en));
 	save_item(NAME(m_nr_a9_esp_gpio0));
 	save_item(NAME(m_nr_b8_divmmc_ep_0));
@@ -4127,6 +4287,11 @@ void specnext_state::machine_reset()
 
 	m_nr_a0_pi_peripheral_en = 0x00;
 	m_nr_a2_pi_i2s_ctl = 0x00;
+	m_pi_i2s_audio_l = 0x200;
+	m_pi_i2s_audio_r = 0x200;
+	m_pi_fe_ear = false;
+	pi_i2s_update();
+	ear_update(false);
 
 	m_nr_a8_esp_gpio0_en = 0;
 	m_nr_a9_esp_gpio0 = 1;
@@ -4321,11 +4486,21 @@ void specnext_state::tbblue(machine_config &config)
 
 	SPEAKER(config.replace(), "speakers", 2).front();
 	m_speaker->add_route(ALL_OUTPUTS, "speakers", 0.50, 1);
+	// Index: EAR bit 1, MIC bit 0, at the mixer's 512 and 128
+	static const double speaker_levels[4] = { 0.0, 0.2, 0.8, 1.0 };
+	m_speaker->set_levels(4, speaker_levels);
+
+	// Tape audio reaches the mixer only through the MIC input
+	m_cassette->reset_routes();
 
 	DAC_8BIT_R2R(config, m_dac[0], 0).add_route(ALL_OUTPUTS, "speakers", 0.75, 0);
 	DAC_8BIT_R2R(config, m_dac[1], 0).add_route(ALL_OUTPUTS, "speakers", 0.75, 0);
 	DAC_8BIT_R2R(config, m_dac[2], 0).add_route(ALL_OUTPUTS, "speakers", 0.75, 1);
 	DAC_8BIT_R2R(config, m_dac[3], 0).add_route(ALL_OUTPUTS, "speakers", 0.75, 1);
+
+	// Pi I2S audio, as loud as one 8-bit DAC
+	DAC_10BIT_R2R(config, m_pi_dac[0], 0).add_route(ALL_OUTPUTS, "speakers", 0.75, 0);
+	DAC_10BIT_R2R(config, m_pi_dac[1], 0).add_route(ALL_OUTPUTS, "speakers", 0.75, 1);
 
 	config.device_remove("ay_slot");
 	for (auto i = 0; i < 3; ++i)
