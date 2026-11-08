@@ -116,6 +116,7 @@ protected:
 	u8 channel_int_state(int ch) const noexcept { return m_channel[ch]->m_int_state; }
 	u8 channel_mode(int ch) const noexcept { return m_channel[ch]->m_mode; }
 	void interrupt_check();
+	void channel_int_request(int ch) { m_channel[ch]->m_int_state |= Z80_DAISY_INT; interrupt_check(); }
 
 	z80ctc_channel_device &channel_config(int ch) { return *m_channel[ch].lookup(); }
 

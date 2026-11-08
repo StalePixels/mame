@@ -48,6 +48,9 @@
 #include "sound/dac.h"
 #include "speaker.h"
 
+#include <array>
+#include <atomic>
+
 
 #define LOG_IO      (1U << 1)
 #define LOG_MEM     (1U << 2)
@@ -76,6 +79,14 @@ constexpr u8 INT_PRIORITY_ULA      = 11;
 constexpr u8 INT_PRIORITY_UART0_TX = 12;
 constexpr u8 INT_PRIORITY_UART1_TX = 13;
 constexpr u8 INT_PRIORITY_NMI      = 15;
+
+// How often the emulation takes what the Pi's SPI slave hands it
+const attotime PI_SPI_POLL = attotime::from_usec(10);
+
+// pi_debug_control_param.vhd states and the work handed to the emulation
+enum : u8 { PI_S_IDLE, PI_S_ERROR, PI_S_A2, PI_S_A1, PI_S_A0, PI_S_L1, PI_S_L0, PI_S_BRAM_R, PI_S_BRAM_W, PI_S_SRAM_R, PI_S_SRAM_W };
+enum : u8 { PI_DO_NR_W, PI_DO_CPU_REG_W, PI_DO_SYSTEM };
+enum : u8 { BUS_CPU, BUS_PI, BUS_DMA };
 
 
 struct video_timings_info {
@@ -185,6 +196,7 @@ protected:
 	void map_io(address_map &map) ATTR_COLD;
 	void map_regs(address_map &map) ATTR_COLD;
 	u8 reg_r(offs_t reg);
+	u8 nr_rd(offs_t reg);
 	void reg_w(offs_t reg, u8 data);
 	void mmu_w(offs_t bank, u8 data);
 	void mmu_x2_w(offs_t bank, u8 data);
@@ -235,6 +247,26 @@ private:
 	void line_irq_adjust();
 	void irq_w(int state);
 	void pi_i2s_frame_w(s32 left, s32 right);
+	// Pi SPI slave: QEMU's thread
+	void pi_spi_select_w(int state);
+	void pi_spi_transfer(u8 const *mosi, u8 *miso, u32 length);
+	u8 pi_spi_byte(u8 mosi);
+	void pi_spi_decoder_reset();
+	u8 pi_spi_status();
+	u8 pi_spi_sram_r(u32 addr);
+	void pi_spi_sram_w(u32 addr, u8 data);
+	u8 pi_spi_bram_r(u32 addr);
+	void pi_spi_bram_w(u32 addr, u8 data);
+	u8 pi_spi_cpu_reg_r(u8 reg);
+	bool pi_spi_push(u8 kind, u8 a, u8 b);
+	// Pi SPI slave and bus arbiter: emulation thread
+	TIMER_CALLBACK_MEMBER(pi_spi_poll);
+	void pi_spi_pins_update();
+	void pi_spi_system_w(u8 command);
+	void dma_busreq_w(int state);
+	void cpu_busack_w(int state);
+	void bus_arbitrate();
+	void bus_ack_update();
 	void pi_i2s_update();
 	void pi_i2s_2d_update();
 	u16 pi_audio_l() const;
@@ -253,8 +285,8 @@ private:
 	// 32 cycles for 48K/+3 timing, 36 for 128K/Pentagon
 	u8 irq_pulse_cycles() const { return (BIT(m_eff_nr_03_machine_timing, 2) || (BIT(m_eff_nr_03_machine_timing, 1) && !BIT(m_eff_nr_03_machine_timing, 0))) ? 36 : 32; }
 
-	bool nmi_assert_mf() { return ((m_io_nmi->read() & 1) || m_nr_02_generate_mf_nmi) && m_nr_06_button_m1_nmi_en; }
-	bool nmi_assert_divmmc() { return ((m_io_nmi->read() & 2) || m_nr_02_generate_divmmc_nmi) && m_nr_06_button_drive_nmi_en; }
+	bool nmi_assert_mf() { return (((m_io_nmi->read() | m_pi_spi_nmi) & 1) || m_nr_02_generate_mf_nmi) && m_nr_06_button_m1_nmi_en; }
+	bool nmi_assert_divmmc() { return (((m_io_nmi->read() | m_pi_spi_nmi) & 2) || m_nr_02_generate_divmmc_nmi) && m_nr_06_button_drive_nmi_en; }
 	void nr_02_w(u8 nr_wr_dat);
 	bool nr_02_iotrap() { return m_nr_da_iotrap_cause & 3; }
 	void nr_07_cpu_speed_w(u8 data);
@@ -598,6 +630,53 @@ private:
 	u16 m_pi_i2s_audio_l; // u10, unsigned, silence 0x200
 	u16 m_pi_i2s_audio_r; // u10
 	bool m_pi_fe_ear;
+
+	// Pi SPI slave: the core's spi_slave and pi_debug_control_param.  The
+	// Pi clocks the slave, so its decoder runs on QEMU's thread, inside the
+	// transfer call, and answers at once from the live machine.  What only
+	// the emulation thread can do goes through m_pi_spi_ring, which the Pi
+	// never waits for.  Not saved: QEMU is not part of save states.
+	bool m_pi_spi_fitted; // g_option(4)
+	bool m_pi_spi_host = false; // the rs232_rpi card has the SPI interface
+	emu_timer *m_pi_spi_timer = nullptr;
+	u8 *m_pi_ram = nullptr; // m_ram, for QEMU's thread
+	u32 m_pi_ram_size = 0;
+
+	// QEMU's thread only
+	u8 m_pi_spi_state = 0;
+	u8 m_pi_spi_cmd = 0xff; // r_is_cmd_*: low nibble of the command byte, 0xff for none
+	u32 m_pi_spi_a = 0; // u21
+	u16 m_pi_spi_l = 0;
+	u8 m_pi_spi_di = 0;
+	bool m_pi_spi_status_error = false;
+	u32 m_pi_spi_reset_seen = 0;
+	std::array<u8, 0x20> m_pi_cpu_wr_val{};
+	std::array<u32, 0x20> m_pi_cpu_wr_seq{};
+
+	// shared by both threads
+	std::atomic<u16> m_pi_spi_pins = 0xff; // bit 8: slave on; else bits 7:0 are what MISO reads
+	std::atomic<u32> m_pi_spi_reset_gen = 0;
+	std::atomic<bool> m_pi_spi_status_reset = true;
+	std::atomic<u8> m_pi_spi_bus = 0b01; // bus_control: 01 idle, 00 request, 11 single step
+	std::atomic<bool> m_pi_busak = false;
+	std::atomic<bool> m_dma_busak = false;
+	std::atomic<bool> m_cpu_halt = false;
+	std::array<std::array<u8, 3>, 4096> m_pi_spi_ring;
+	std::atomic<u32> m_pi_spi_head = 0;
+	std::atomic<u32> m_pi_spi_tail = 0;
+
+	// emulation thread only
+	u8 m_pi_spi_nmi; // u2: SYSTEM NMI pulse, as the NMI buttons
+	bool m_pi_spi_nr_w;
+
+	// bus arbiter (device/arbiter_dma.vhd): Pi pause first, DMA second
+	bool m_pi_busrq;
+	bool m_dma_busrq;
+	bool m_cpu_busrq;
+	bool m_cpu_busack;
+	bool m_dma_bai;
+	u8 m_bus_owner;
+
 	bool m_ear_sig;
 	u8 m_ear_relax_counter; // u7
 	bool m_audio_ear;
@@ -1647,7 +1726,20 @@ void specnext_state::update_dma_delay()
 		LOGINTVVV("DMA delay %d (int_status=%04x, int_mask=%04x)\n", (dma_int_mask & m_im2_int_status) ? 1 : 0, m_im2_int_status, dma_int_mask);
 }
 
+// The Z80's read of port 0x253B.  The Pi's NR_READ uses nr_rd alone.
 u8 specnext_state::reg_r(offs_t nr_register)
+{
+	const u8 data = nr_rd(nr_register);
+	if (nr_register == 0x2c)
+		m_nr_2d_i2s_sample = BIT(pi_audio_l(), 0, 2);
+	else if (nr_register == 0x2e)
+		m_nr_2d_i2s_sample = BIT(pi_audio_r(), 0, 2);
+	return data;
+}
+
+// The NextReg read multiplexer.  The Pi's slave calls it on QEMU's thread,
+// so it must change nothing.
+u8 specnext_state::nr_rd(offs_t nr_register)
 {
 	u8 port_253b_dat;
 
@@ -1813,14 +1905,12 @@ u8 specnext_state::reg_r(offs_t nr_register)
 		break;
 	case 0x2c:
 		port_253b_dat = BIT(pi_audio_l(), 2, 8);
-		m_nr_2d_i2s_sample = BIT(pi_audio_l(), 0, 2);
 		break;
 	case 0x2d:
 		port_253b_dat = (m_nr_2d_i2s_sample << 6) | 0b000000;
 		break;
 	case 0x2e:
 		port_253b_dat = BIT(pi_audio_r(), 2, 8);
-		m_nr_2d_i2s_sample = BIT(pi_audio_r(), 0, 2);
 		break;
 	case 0x2f:
 		port_253b_dat = (0b000000 << 2) | BIT(m_nr_30_tm_scrollx, 8, 2);
@@ -1975,7 +2065,7 @@ u8 specnext_state::reg_r(offs_t nr_register)
 		port_253b_dat = (0b0000 << 4);// | i_GPIO(27 downto 24);
 		break;
 	case 0xa0:
-		port_253b_dat = (0b00 << 6) | (BIT(m_nr_a0_pi_peripheral_en, 3, 3) << 2) | (0b00 << 1) | BIT(m_nr_a0_pi_peripheral_en, 0);
+		port_253b_dat = (0b00 << 6) | (BIT(m_nr_a0_pi_peripheral_en, 3, 3) << 3) | (0 << 2) | ((BIT(m_nr_a0_pi_peripheral_en, 1) && m_pi_spi_fitted) << 1) | BIT(m_nr_a0_pi_peripheral_en, 0);
 		break;
 	case 0xa2:
 		port_253b_dat = (BIT(m_nr_a2_pi_i2s_ctl, 6, 2) << 6) | (0 << 5) | (BIT(m_nr_a2_pi_i2s_ctl, 2, 3) << 2) | (1 << 1) | BIT(m_nr_a2_pi_i2s_ctl, 0);
@@ -2647,6 +2737,7 @@ void specnext_state::reg_w(offs_t nr_wr_reg, u8 nr_wr_dat)
 		break;
 	case 0x91:
 		m_nr_91_pi_gpio_o_en = nr_wr_dat;
+		pi_spi_pins_update();
 		break;
 	case 0x92:
 		m_nr_92_pi_gpio_o_en = nr_wr_dat;
@@ -2659,6 +2750,7 @@ void specnext_state::reg_w(offs_t nr_wr_reg, u8 nr_wr_dat)
 		break;
 	case 0x99:
 		m_nr_99_pi_gpio_o = nr_wr_dat;
+		pi_spi_pins_update();
 		break;
 	case 0x9a:
 		m_nr_9a_pi_gpio_o = nr_wr_dat;
@@ -2668,6 +2760,7 @@ void specnext_state::reg_w(offs_t nr_wr_reg, u8 nr_wr_dat)
 		break;
 	case 0xa0:
 		m_nr_a0_pi_peripheral_en = nr_wr_dat;
+		pi_spi_pins_update();
 		break;
 	case 0xa2:
 		m_nr_a2_pi_i2s_ctl = nr_wr_dat;
@@ -2770,9 +2863,13 @@ void specnext_state::nr_02_w(u8 nr_wr_dat)
 	if (BIT(~nr_wr_dat, 4))
 		m_nr_da_iotrap_cause = 0;
 
-	m_nr_02_generate_mf_nmi = BIT(nr_wr_dat, 3);
-	m_nr_02_generate_divmmc_nmi = BIT(nr_wr_dat, 2);
-	nmi_rq();
+	// only Z80 and copper writes make the NMIs, not the Pi
+	if (!m_pi_spi_nr_w)
+	{
+		m_nr_02_generate_mf_nmi = BIT(nr_wr_dat, 3);
+		m_nr_02_generate_divmmc_nmi = BIT(nr_wr_dat, 2);
+		nmi_rq();
+	}
 
 	if (BIT(nr_wr_dat, 1)) // hard reset
 	{
@@ -3078,6 +3175,419 @@ void specnext_state::nmi_rq()
 			update_dma_delay();
 		}
 	}
+}
+
+// Pi SPI slave: serial/spi_slave.vhd and device/pi_debug_control/
+// pi_debug_control_param.vhd in the FPGA source.  The functions down to
+// pi_spi_byte run on QEMU's thread.
+//
+// Each byte is taken as the core takes it: at its start the slave loads
+// REG_DI onto MISO (tx_ack), and a read started then completes during the
+// byte; at its end the byte is received (rx_valid) and the decoder acts on
+// it.  Memory reads and writes go to the machine's memory at once, as the
+// core's SRAM port C and block RAM ports do: the Pi is never refused a
+// cycle, so no byte is late.
+//
+// Timing: the slave works outside the machine's clock domain and is only
+// frame-level accurate. It runs on QEMU's thread, not in emulated time:
+// reads see the state wherever emulation has reached, which is frozen at
+// the end of the last frame while MAME waits for real time, and memory
+// writes land at no defined emulated time. NextReg writes, CPU control,
+// register writes and SYSTEM commands are queued and take effect when the
+// emulation next runs (pi_spi_poll), up to a frame later. QEMU does not
+// pace the bytes by the SPI clock, so transfers run faster than the core's
+// SPI clock allows.
+
+void specnext_state::pi_spi_select_w(int state)
+{
+	// CE0 high holds the decoder in reset (pi_debug_control_param.vhd 331)
+	pi_spi_decoder_reset();
+}
+
+void specnext_state::pi_spi_transfer(u8 const *mosi, u8 *miso, u32 length)
+{
+	for (u32 i = 0; i < length; i++)
+		miso[i] = pi_spi_byte(mosi[i]);
+}
+
+void specnext_state::pi_spi_decoder_reset()
+{
+	m_pi_spi_state = PI_S_IDLE;
+	m_pi_spi_status_error = false;
+}
+
+u8 specnext_state::pi_spi_status()
+{
+	const u8 bus = m_pi_spi_bus.load();
+	u8 bus_status;
+	if (bus == 0b00)
+		bus_status = m_pi_busak.load() ? 0b10 : 0b01;
+	else if (bus == 0b01)
+		bus_status = 0b00;
+	else
+		bus_status = 0b11;
+	// had reset, bus_status, dma_active_n, cpu_halted_n, 0, 0, had error
+	return (m_pi_spi_status_reset.exchange(false) << 7) | (bus_status << 5) | ((m_dma_busak.load() ? 0 : 1) << 4)
+			| ((m_cpu_halt.load() ? 0 : 1) << 3) | (m_pi_spi_status_error ? 1 : 0);
+}
+
+// SRAM port C: the full 21-bit SRAM address, ROM areas included; MAME's
+// RAM is laid out the same way.  No chip there (1M machines): 0xff.
+u8 specnext_state::pi_spi_sram_r(u32 addr)
+{
+	return (addr < m_pi_ram_size) ? std::atomic_ref<u8>(m_pi_ram[addr]).load(std::memory_order_relaxed) : 0xff;
+}
+
+void specnext_state::pi_spi_sram_w(u32 addr, u8 data)
+{
+	if (addr < m_pi_ram_size)
+		std::atomic_ref<u8>(m_pi_ram[addr]).store(data, std::memory_order_relaxed);
+}
+
+// Address bit 15 picks bank 7 (8K) or bank 5 (16K) (zxnext.vhd 3825-3830)
+u8 specnext_state::pi_spi_bram_r(u32 addr)
+{
+	u8 &cell = BIT(addr, 15) ? m_bram_bank7[addr & 0x1fff] : m_bram_bank5[addr & 0x3fff];
+	return std::atomic_ref<u8>(cell).load(std::memory_order_relaxed);
+}
+
+// Unlike the Z80's writes, these cannot bring the screen up to date first:
+// that is for the emulation thread only
+void specnext_state::pi_spi_bram_w(u32 addr, u8 data)
+{
+	u8 &cell = BIT(addr, 15) ? m_bram_bank7[addr & 0x1fff] : m_bram_bank5[addr & 0x3fff];
+	std::atomic_ref<u8>(cell).store(data, std::memory_order_relaxed);
+}
+
+// A register write the emulation has not made yet reads back as written
+u8 specnext_state::pi_spi_cpu_reg_r(u8 reg)
+{
+	const u32 applied = m_pi_spi_tail.load(std::memory_order_acquire);
+	auto pending = [this, applied] (u8 r) { return s32(m_pi_cpu_wr_seq[r] - applied) > 0; };
+	if (reg <= 0x19 && pending(reg))
+		return m_pi_cpu_wr_val[reg];
+	u8 data = m_maincpu->debug_reg_r(reg);
+	if (reg >= 0x1a && pending(0x1b))
+		data = (data & ~0x07) | (m_pi_cpu_wr_val[0x1b] & 0x07);
+	return data;
+}
+
+// Hand work to the emulation.  A full ring (the emulation has stopped,
+// for example paused) drops it.
+bool specnext_state::pi_spi_push(u8 kind, u8 a, u8 b)
+{
+	const u32 head = m_pi_spi_head.load(std::memory_order_relaxed);
+	if ((head - m_pi_spi_tail.load(std::memory_order_acquire)) >= m_pi_spi_ring.size())
+		return false;
+	m_pi_spi_ring[head % m_pi_spi_ring.size()] = { kind, a, b };
+	m_pi_spi_head.store(head + 1, std::memory_order_release);
+	return true;
+}
+
+u8 specnext_state::pi_spi_byte(u8 mosi)
+{
+	const u16 pins = m_pi_spi_pins.load();
+	if (!BIT(pins, 8))
+	{
+		// slave off or not fitted: held in reset, and the board decides MISO
+		pi_spi_decoder_reset();
+		return pins & 0xff;
+	}
+	const u32 reset_gen = m_pi_spi_reset_gen.load();
+	if (reset_gen != m_pi_spi_reset_seen)
+	{
+		m_pi_spi_reset_seen = reset_gen;
+		pi_spi_decoder_reset();
+	}
+
+	// start of the byte: REG_DI goes out; reads for the byte start here
+	const u8 miso = m_pi_spi_di;
+	const u8 state = m_pi_spi_state;
+	switch (state)
+	{
+	case PI_S_SRAM_R:
+		if (m_pi_spi_l)
+		{
+			m_pi_spi_di = pi_spi_sram_r(m_pi_spi_a);
+			m_pi_spi_a = (m_pi_spi_a + 1) & 0x1f'ffff;
+		}
+		break;
+	case PI_S_BRAM_R:
+		if (m_pi_spi_l)
+		{
+			m_pi_spi_di = pi_spi_bram_r(m_pi_spi_a);
+			m_pi_spi_a = (m_pi_spi_a + 1) & 0x1f'ffff;
+		}
+		break;
+	case PI_S_SRAM_W:
+	case PI_S_BRAM_W:
+		if (m_pi_spi_l)
+			m_pi_spi_l--;
+		break;
+	}
+
+	// end of the byte: decode (pi_debug_control_param.vhd 335-526)
+	// 0xaf, and anything without 0xa in the high nibble, is no command
+	const u8 cmd = ((mosi >> 4) == 0x0a && (mosi & 0x0f) != 0x0f) ? (mosi & 0x0f) : 0xff;
+	const u8 r = m_pi_spi_cmd;
+	if (state == PI_S_IDLE || state == PI_S_ERROR)
+		m_pi_spi_cmd = cmd;
+
+	u8 next = PI_S_ERROR;
+	switch (state)
+	{
+	case PI_S_IDLE:
+		switch (cmd)
+		{
+		case 0x7: case 0x8: next = PI_S_A2; break;
+		case 0x9: case 0xa: next = PI_S_A1; break;
+		case 0x1: case 0x2: case 0xb: case 0xc: case 0xd: case 0xe: next = PI_S_A0; break;
+		case 0x3: next = PI_S_L0; break;
+		case 0x0: case 0x4: case 0x5: case 0x6: next = PI_S_IDLE; break;
+		default: next = PI_S_ERROR; break;
+		}
+		break;
+	case PI_S_ERROR:
+		next = (cmd == 0x1 || cmd == 0x2) ? PI_S_A0 : PI_S_ERROR;
+		break;
+	case PI_S_A2: next = PI_S_A1; break;
+	case PI_S_A1: next = PI_S_A0; break;
+	case PI_S_A0: next = PI_S_L1; break;
+	case PI_S_L1: next = PI_S_L0; break;
+	case PI_S_L0:
+		switch (r)
+		{
+		case 0x7: next = PI_S_SRAM_R; break;
+		case 0x8: next = PI_S_SRAM_W; break;
+		case 0x9: next = PI_S_BRAM_R; break;
+		case 0xa: next = PI_S_BRAM_W; break;
+		default: next = PI_S_IDLE; break;
+		}
+		break;
+	default: // the data states end when the length has run out
+		next = m_pi_spi_l ? state : PI_S_IDLE;
+		break;
+	}
+
+	switch (state)
+	{
+	case PI_S_A2: m_pi_spi_a = (m_pi_spi_a & 0x00'ffff) | (BIT(mosi, 0, 5) << 16); break;
+	case PI_S_A1: m_pi_spi_a = (m_pi_spi_a & 0x1f'00ff) | (mosi << 8); break;
+	case PI_S_A0: m_pi_spi_a = (m_pi_spi_a & 0x1f'ff00) | mosi; break;
+	case PI_S_L1: m_pi_spi_l = (m_pi_spi_l & 0x00ff) | (mosi << 8); break;
+	case PI_S_L0: m_pi_spi_l = (m_pi_spi_l & 0xff00) | mosi; break;
+	case PI_S_SRAM_R:
+	case PI_S_BRAM_R:
+		if (m_pi_spi_l)
+			m_pi_spi_l--;
+		break;
+	case PI_S_SRAM_W:
+		// writes of length zero still write one byte
+		m_pi_spi_di = mosi;
+		pi_spi_sram_w(m_pi_spi_a, mosi);
+		m_pi_spi_a = (m_pi_spi_a + 1) & 0x1f'ffff;
+		break;
+	case PI_S_BRAM_W:
+		m_pi_spi_di = mosi;
+		pi_spi_bram_w(m_pi_spi_a, mosi);
+		m_pi_spi_a = (m_pi_spi_a + 1) & 0x1f'ffff;
+		break;
+	}
+
+	if (state == PI_S_A0)
+	{
+		switch (r)
+		{
+		case 0x1: m_pi_spi_di = 0x10; break; // g_version 1
+		case 0x2:
+			m_pi_spi_di = pi_spi_status();
+			m_pi_spi_status_error = false;
+			break;
+		case 0xb:
+			// The core's read of the register takes a few 28 MHz clocks after
+			// this byte, so at the Pi's 2 MHz it is in REG_DI before the next
+			// byte starts; the source does not fix it for faster clocks.
+			m_pi_spi_di = nr_rd(mosi);
+			break;
+		}
+	}
+	else if (state == PI_S_L1)
+	{
+		switch (r)
+		{
+		case 0x1: m_pi_spi_di = 0xff; break; // g_option(12 downto 5) on issue 4 and 5
+		case 0x2: m_pi_spi_di = 0x00; break; // hotkeys: MAME has no QWERT tape keys
+		case 0xc:
+			m_pi_spi_di = mosi;
+			pi_spi_push(PI_DO_NR_W, m_pi_spi_a & 0xff, mosi);
+			break;
+		case 0xd: m_pi_spi_di = pi_spi_cpu_reg_r(m_pi_spi_a & 0x1f); break;
+		case 0xe:
+			m_pi_spi_di = mosi;
+			if (pi_spi_push(PI_DO_CPU_REG_W, m_pi_spi_a & 0x1f, mosi))
+			{
+				m_pi_cpu_wr_val[m_pi_spi_a & 0x1f] = mosi;
+				m_pi_cpu_wr_seq[m_pi_spi_a & 0x1f] = m_pi_spi_head.load(std::memory_order_relaxed);
+			}
+			break;
+		}
+	}
+	else if (state == PI_S_L0 && r == 0x3)
+	{
+		pi_spi_push(PI_DO_SYSTEM, BIT(mosi, 0, 5), 0);
+	}
+	else if (state == PI_S_IDLE)
+	{
+		// bus_control (pi_debug_control_param.vhd 818-868).  The emulation
+		// moves it from 11 to 00 when the CPU has taken the bus back.
+		u8 bus = m_pi_spi_bus.load();
+		if (cmd == 0x5)
+			m_pi_spi_bus.store(0b01);
+		else if ((cmd == 0x4 || cmd == 0x6) && bus == 0b01)
+			m_pi_spi_bus.compare_exchange_strong(bus, 0b00);
+		else if (cmd == 0x6 && bus == 0b00 && m_pi_busak.load())
+			m_pi_spi_bus.compare_exchange_strong(bus, 0b11);
+	}
+
+	m_pi_spi_state = next;
+	if (next == PI_S_ERROR)
+		m_pi_spi_status_error = true;
+
+	return miso;
+}
+
+// MISO with the slave off: GPIO 9 is then the Pi GPIO output, if enabled
+// (zxnext.vhd 2613-2614), else undriven.  An undriven line is up to the
+// board and the Pi, not the source: 0xff.  No slave fitted (KS1, g_option
+// 0000): MISO is held low while the slave is enabled.
+void specnext_state::pi_spi_pins_update()
+{
+	u16 pins;
+	if (BIT(m_nr_a0_pi_peripheral_en, 1))
+		pins = m_pi_spi_fitted ? 0x100 : 0x00;
+	else if (BIT(m_nr_91_pi_gpio_o_en, 1))
+		pins = BIT(m_nr_99_pi_gpio_o, 1) ? 0xff : 0x00;
+	else
+		pins = 0xff;
+	m_pi_spi_pins.store(pins);
+}
+
+// Take what the slave has handed over, then follow its bus request.
+// bus_control is read first: everything the Pi sent before it is then in
+// the ring, so register writes land before a resume releases the CPU.
+TIMER_CALLBACK_MEMBER(specnext_state::pi_spi_poll)
+{
+	const u8 bus = m_pi_spi_bus.load();
+	const u32 head = m_pi_spi_head.load(std::memory_order_acquire);
+	for (u32 tail = m_pi_spi_tail.load(std::memory_order_relaxed); tail != head; )
+	{
+		const auto &work = m_pi_spi_ring[tail % m_pi_spi_ring.size()];
+		switch (work[0])
+		{
+		case PI_DO_NR_W:
+			// lowest priority after copper and Z80 (zxnext.vhd 5329-5336)
+			m_pi_spi_nr_w = true;
+			m_next_regs.write_byte(work[1], work[2]);
+			m_pi_spi_nr_w = false;
+			break;
+		case PI_DO_CPU_REG_W:
+			m_maincpu->debug_reg_w(work[1], work[2]);
+			break;
+		case PI_DO_SYSTEM:
+			pi_spi_system_w(work[1]);
+			break;
+		}
+		m_pi_spi_tail.store(++tail, std::memory_order_release);
+	}
+
+	m_pi_busrq = !BIT(bus, 0);
+	bus_arbitrate();
+}
+
+// Each bit is a one-clock pulse, as the F key it shares with the hotkeys
+// (zxnext.vhd 2255, 6915-6959).  Bits set together all fire.
+void specnext_state::pi_spi_system_w(u8 command)
+{
+	if (BIT(command, 4)) // CTC channel 3 interrupt
+		m_ctc->int_unq_w(3);
+	if (command & 0x0c) // F9 Multiface NMI, F10 divMMC NMI: press and release
+	{
+		m_pi_spi_nmi = (BIT(command, 2) << 1) | BIT(command, 3);
+		nmi_rq();
+		m_pi_spi_nmi = 0;
+		nmi_rq();
+	}
+	if (BIT(command, 1)) // F1 hard reset
+	{
+		m_nr_02_hard_reset = 1;
+		machine().schedule_soft_reset();
+	}
+	else if (BIT(command, 0) && !m_nr_03_config_mode) // F4 soft reset
+	{
+		m_nr_02_reset_type = (BIT(m_nr_02_reset_type, 2) << 1) | BIT(m_nr_02_reset_type, 1) | BIT(m_nr_02_reset_type, 0);
+		machine().schedule_soft_reset();
+	}
+}
+
+void specnext_state::dma_busreq_w(int state)
+{
+	m_dma_busrq = state;
+	bus_arbitrate();
+}
+
+void specnext_state::cpu_busack_w(int state)
+{
+	m_cpu_busack = state;
+	if (!state)
+	{
+		// single step: the CPU has the bus back, so ask for it again
+		u8 bus = 0b11;
+		if (m_pi_spi_bus.compare_exchange_strong(bus, 0b00))
+			m_pi_busrq = true;
+	}
+	bus_arbitrate();
+}
+
+// device/arbiter_dma.vhd.  The Pi's request reaches the CPU only once the
+// CPU runs (it waits for the last machine cycle of an instruction), so
+// after the DMA the CPU runs an instruction before the Pi has the bus.
+// MAME's Z80 grants a bus request only between instructions.
+void specnext_state::bus_arbitrate()
+{
+	if ((m_bus_owner == BUS_PI && !m_pi_busrq) || (m_bus_owner == BUS_DMA && !m_dma_busrq))
+		m_bus_owner = BUS_CPU;
+	if (m_bus_owner == BUS_CPU)
+	{
+		if (m_pi_busrq)
+		{
+			if (!m_cpu_busack)
+				m_bus_owner = BUS_PI;
+		}
+		else if (m_dma_busrq)
+		{
+			m_bus_owner = BUS_DMA;
+		}
+	}
+
+	const bool busrq = m_bus_owner != BUS_CPU;
+	if (busrq != m_cpu_busrq)
+	{
+		m_cpu_busrq = busrq;
+		m_maincpu->set_input_line(Z80_INPUT_LINE_BUSREQ, busrq ? ASSERT_LINE : CLEAR_LINE);
+	}
+	bus_ack_update();
+}
+
+void specnext_state::bus_ack_update()
+{
+	const bool dma = (m_bus_owner == BUS_DMA) && m_cpu_busack;
+	if (dma != m_dma_bai)
+	{
+		m_dma_bai = dma;
+		m_dma->bai_w(dma);
+	}
+	m_pi_busak.store((m_bus_owner == BUS_PI) && m_cpu_busack);
+	m_dma_busak.store(dma);
 }
 
 void specnext_state::leave_nmi(int state)
@@ -3667,6 +4177,14 @@ void specnext_state::machine_start()
 		auto *const pi_i2s = dynamic_cast<device_pi_i2s_interface *>(m_rs232_rpi->get_card_device());
 		if (pi_i2s)
 			pi_i2s->set_i2s_frame_handler(device_pi_i2s_interface::frame_delegate(FUNC(specnext_state::pi_i2s_frame_w), this));
+		auto *const pi_spi = dynamic_cast<device_pi_spi_interface *>(m_rs232_rpi->get_card_device());
+		if (pi_spi)
+		{
+			pi_spi->set_spi_handlers(
+					device_pi_spi_interface::select_delegate(FUNC(specnext_state::pi_spi_select_w), this),
+					device_pi_spi_interface::transfer_delegate(FUNC(specnext_state::pi_spi_transfer), this));
+			m_pi_spi_host = true;
+		}
 	}
 	for (auto i = 0; i < 8; i++)
 		m_bank_ram[i]->configure_entries(0, m_ram->size() / 0x2000, m_ram->pointer(), 0x2000);
@@ -3682,6 +4200,18 @@ void specnext_state::machine_start()
 
 	m_nr_02_hard_reset = 1;
 	m_nr_10_coreid = 0b00000; // Works but must be 1 if Next core bootrom selected
+
+	m_pi_ram = m_ram->pointer();
+	m_pi_ram_size = m_ram->size();
+	m_pi_spi_timer = timer_alloc(FUNC(specnext_state::pi_spi_poll), this);
+	m_pi_spi_nmi = 0;
+	m_pi_spi_nr_w = false;
+	m_pi_busrq = false;
+	m_dma_busrq = false;
+	m_cpu_busrq = false;
+	m_cpu_busack = false;
+	m_dma_bai = false;
+	m_bus_owner = 0;
 
 	// Save
 	save_item(NAME(m_page_shadow));
@@ -3850,6 +4380,12 @@ void specnext_state::machine_start()
 	save_item(NAME(m_pi_i2s_audio_l));
 	save_item(NAME(m_pi_i2s_audio_r));
 	save_item(NAME(m_pi_fe_ear));
+	save_item(NAME(m_pi_busrq));
+	save_item(NAME(m_dma_busrq));
+	save_item(NAME(m_cpu_busrq));
+	save_item(NAME(m_cpu_busack));
+	save_item(NAME(m_dma_bai));
+	save_item(NAME(m_bus_owner));
 	save_item(NAME(m_ear_sig));
 	save_item(NAME(m_ear_relax_counter));
 	save_item(NAME(m_audio_ear));
@@ -4067,6 +4603,7 @@ void specnext_state::machine_reset()
 	m_maincpu->set_input_line(INPUT_LINE_NMI, CLEAR_LINE);
 	m_irq_line_timer->reset();
 
+	const bool hard = m_nr_02_hard_reset;
 	if (m_nr_02_hard_reset)
 		reset_hard();
 
@@ -4285,7 +4822,25 @@ void specnext_state::machine_reset()
 	m_nr_92_pi_gpio_o_en = 0x00;
 	m_nr_93_pi_gpio_o_en = 0x00;
 
-	m_nr_a0_pi_peripheral_en = 0x00;
+	// A soft reset keeps the Pi SPI slave on (zxnext.vhd 5640-5641).  A hard
+	// reset reloads the core, and the source gives 0xA0 no start value: take
+	// the FPGA's power-on 0, so the slave is off.
+	m_nr_a0_pi_peripheral_en = hard ? 0x00 : (m_nr_a0_pi_peripheral_en & 0x02);
+	pi_spi_pins_update();
+
+	// The core reset resets the slave and ends a pause; status bit 7 shows it
+	m_pi_spi_bus.store(0b01);
+	m_pi_spi_status_reset.store(true);
+	m_pi_spi_reset_gen.fetch_add(1);
+	m_pi_busrq = false;
+	m_dma_busrq = false;
+	m_bus_owner = 0;
+	m_cpu_busrq = false;
+	m_maincpu->set_input_line(Z80_INPUT_LINE_BUSREQ, CLEAR_LINE);
+	bus_ack_update();
+	m_cpu_halt.store(false);
+	if (m_pi_spi_host)
+		m_pi_spi_timer->adjust(PI_SPI_POLL, 0, PI_SPI_POLL);
 	m_nr_a2_pi_i2s_ctl = 0x00;
 	m_pi_i2s_audio_l = 0x200;
 	m_pi_i2s_audio_r = 0x200;
@@ -4403,7 +4958,8 @@ void specnext_state::tbblue(machine_config &config)
 	m_maincpu->out_nextreg_cb().set([this](offs_t offset, u8 data) { m_next_regs.write_byte(offset, data); });
 	m_maincpu->in_nextreg_cb().set([this](offs_t offset) { return m_next_regs.read_byte(offset); });
 	m_maincpu->out_retn_seen_cb().set(FUNC(specnext_state::leave_nmi));
-	m_maincpu->busack_cb().set(m_dma, FUNC(specnext_dma_device::bai_w));
+	m_maincpu->busack_cb().set(FUNC(specnext_state::cpu_busack_w));
+	m_maincpu->halt_cb().set([this](int state) { m_cpu_halt.store(state != 0); });
 	m_maincpu->irqack_cb().set([this](int) { m_screen->update_now(); });
 
 	SPECNEXT_IM2(config, m_im2_line);
@@ -4419,7 +4975,7 @@ void specnext_state::tbblue(machine_config &config)
 	m_ctc->intr_callback().set(FUNC(specnext_state::irq_w));
 
 	SPECNEXT_DMA(config, m_dma, 28_MHz_XTAL / 8);
-	m_dma->out_busreq_callback().set_inputline(m_maincpu, Z80_INPUT_LINE_BUSREQ);
+	m_dma->out_busreq_callback().set(FUNC(specnext_state::dma_busreq_w));
 	m_dma->in_mreq_callback().set(FUNC(specnext_state::dma_mreq_r));
 	m_dma->out_mreq_callback().set([this](offs_t offset, u8 data) { m_program.write_byte(offset, data); });
 	m_dma->in_iorq_callback().set([this](offs_t offset) { return m_io.read_byte(offset); });
@@ -4548,6 +5104,7 @@ void specnext_state::tbblue(machine_config &config)
 
 	m_machine_id = 0x08;
 	m_board_issue = 0;
+	m_pi_spi_fitted = true;
 	m_ram->set_default_size("2M").set_extra_options("1M,4M").set_default_value(0);
 }
 
@@ -4558,6 +5115,7 @@ void specnext_state::ks1(machine_config &config)
 
 	m_machine_id = 0x0a;
 	m_board_issue = 1;
+	m_pi_spi_fitted = false; // g_option = 0000
 	m_ram->set_default_size("1M").set_extra_options("2M");
 
 	subdevice<rs232_port_device>("rs232_esp")->set_default_option(nullptr);
