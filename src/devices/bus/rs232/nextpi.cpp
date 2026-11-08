@@ -16,6 +16,12 @@
     repo).  The Next is the Pi's HAT and has no ID EEPROM, so no HAT
     overlay is loaded.
 
+    The Pi's I2S output (PCM_DOUT) goes to the host through
+    device_pi_i2s_interface.  The Pi is always the I2S master on the
+    Next, so QEMU makes the frames on its own clock; the card replays
+    them in emulated time.  Next audio to the Pi (PCM_DIN) is not
+    emulated.
+
     QEMU can only be started once per process.  It keeps running through
     hard resets and stops when the process exits.  Pi state is not part
     of save states.
@@ -44,6 +50,8 @@ extern "C" {
 #include "ioprocs.h"
 #include "strformat.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <cerrno>
@@ -66,6 +74,9 @@ extern "C" {
 namespace {
 
 constexpr unsigned IN_HIGH_WATER = 4096;
+
+// I2S frames between QEMU's thread and the emulation: a power of 2
+constexpr u32 I2S_RING = 1 << 14;
 
 class nextpi_qemu
 {
@@ -98,7 +109,37 @@ public:
 
 	std::string start(std::string const &image, std::vector<u8> const &kernel, std::vector<u8> const &initrd, std::vector<u8> const &dtb, std::vector<u8> const &cmdline);
 
+	// I2S frames from the Pi, for the emulation thread
+	double i2s_rate() const { return m_i2s_rate.load(std::memory_order_relaxed); }
+	u32 i2s_fill() const { return m_i2s_head.load(std::memory_order_acquire) - m_i2s_tail.load(std::memory_order_relaxed); }
+	std::array<s32, 2> i2s_pop()
+	{
+		u32 const tail = m_i2s_tail.load(std::memory_order_relaxed);
+		std::array<s32, 2> const frame = m_i2s_ring[tail & (I2S_RING - 1)];
+		m_i2s_tail.store(tail + 1, std::memory_order_release);
+		return frame;
+	}
+	void i2s_skip(u32 frames) { m_i2s_tail.fetch_add(frames, std::memory_order_release); }
+
 private:
+	// QEMU's main loop thread, with QEMU's lock held.  A full ring drops
+	// the frame: the emulation has stopped taking them.
+	static void i2s_tx(void *opaque, int32_t const sample[2], PinesyI2SFormat const *format)
+	{
+		nextpi_qemu &qemu = *reinterpret_cast<nextpi_qemu *>(opaque);
+		qemu.m_i2s_rate.store(format->frame_rate, std::memory_order_relaxed);
+		u32 const head = qemu.m_i2s_head.load(std::memory_order_relaxed);
+		if ((head - qemu.m_i2s_tail.load(std::memory_order_acquire)) >= I2S_RING)
+			return;
+		qemu.m_i2s_ring[head & (I2S_RING - 1)] = { sample[0], sample[1] };
+		qemu.m_i2s_head.store(head + 1, std::memory_order_release);
+	}
+
+	std::array<std::array<s32, 2>, I2S_RING> m_i2s_ring;
+	std::atomic<u32> m_i2s_head = 0;
+	std::atomic<u32> m_i2s_tail = 0;
+	std::atomic<double> m_i2s_rate = 0.0;
+
 	std::thread m_thread;
 	std::atomic<bool> m_done = false;
 	std::string m_image;
@@ -503,6 +544,8 @@ std::string nextpi_qemu::start(std::string const &image, std::vector<u8> const &
 	m_thread = std::thread(
 			[this] ()
 			{
+				PinesyI2SHandlers const handlers = { &nextpi_qemu::i2s_tx, nullptr };
+				pinesy_bridge_set_i2s(&handlers, this);
 				pinesy_bridge_run(int(m_argv.size() - 1), m_argv.data());
 				m_done = true;
 			});
@@ -510,7 +553,7 @@ std::string nextpi_qemu::start(std::string const &image, std::vector<u8> const &
 }
 
 
-class nextpi_device : public buffered_rs232_device<16>, public device_image_interface
+class nextpi_device : public buffered_rs232_device<16>, public device_image_interface, public device_pi_i2s_interface
 {
 public:
 	nextpi_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock);
@@ -541,10 +584,15 @@ protected:
 
 private:
 	TIMER_CALLBACK_MEMBER(poll);
+	TIMER_CALLBACK_MEMBER(i2s_frame);
 	void pump();
+	void i2s_poll();
 
 	required_ioport m_baud_config;
 	emu_timer *m_poll_timer;
+	emu_timer *m_i2s_timer;
+	double m_i2s_rate;
+	double m_i2s_level;
 	int m_fd;
 	std::deque<u8> m_in;
 	std::deque<u8> m_out;
@@ -559,8 +607,12 @@ INPUT_PORTS_END
 nextpi_device::nextpi_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
 	: buffered_rs232_device<16>(mconfig, NEXTPI, tag, owner, clock)
 	, device_image_interface(mconfig, *this)
+	, device_pi_i2s_interface(mconfig, *this)
 	, m_baud_config(*this, "RS232_BAUD")
 	, m_poll_timer(nullptr)
+	, m_i2s_timer(nullptr)
+	, m_i2s_rate(0.0)
+	, m_i2s_level(0.0)
 	, m_fd(-1)
 {
 }
@@ -575,6 +627,7 @@ ioport_constructor nextpi_device::device_input_ports() const
 void nextpi_device::device_start()
 {
 	m_poll_timer = timer_alloc(FUNC(nextpi_device::poll), this);
+	m_i2s_timer = timer_alloc(FUNC(nextpi_device::i2s_frame), this);
 }
 
 
@@ -586,6 +639,9 @@ void nextpi_device::device_reset()
 	output_dcd(0);
 	output_dsr(0);
 	output_cts(0);
+
+	m_i2s_timer->adjust(attotime::never);
+	m_i2s_rate = 0.0;
 
 	if (m_fd >= 0)
 		m_poll_timer->adjust(attotime::from_msec(1), 0, attotime::from_msec(1));
@@ -695,6 +751,8 @@ void nextpi_device::call_unload()
 	m_in.clear();
 	m_out.clear();
 	m_poll_timer->adjust(attotime::never);
+	m_i2s_timer->adjust(attotime::never);
+	m_i2s_rate = 0.0;
 }
 
 
@@ -721,6 +779,66 @@ TIMER_CALLBACK_MEMBER(nextpi_device::poll)
 	}
 
 	pump();
+	i2s_poll();
+}
+
+
+// QEMU makes I2S frames in bursts on its virtual clock, which follows the
+// host's real time; the emulation takes one frame per period of the Pi's
+// frame rate in emulated time, which runs in slices of a video frame.  The
+// ring absorbs both and holds about I2S_TARGET of audio.  Long-term drift
+// between the two clocks is trimmed by changing the replay period by at
+// most I2S_TRIM, in proportion to how far the smoothed fill is from the
+// target, so steady state has no dropped or repeated frames.  Only a gross
+// error, such as a pause of the emulation, skips frames (fill above
+// I2S_HIGH targets) or stops the replay (ring empty, the Next keeps its
+// last sample) until the ring fills to the target again.
+constexpr double I2S_TARGET = 0.04;
+constexpr double I2S_TRIM = 0.005;
+constexpr u32 I2S_HIGH = 3;
+
+void nextpi_device::i2s_poll()
+{
+	double const rate = s_qemu.i2s_rate();
+	if (rate <= 0.0)
+		return;
+	u32 const target = std::clamp<u32>(u32(rate * I2S_TARGET), 64, I2S_RING / 4);
+	u32 fill = s_qemu.i2s_fill();
+
+	if ((m_i2s_rate == 0.0) || (rate != m_i2s_rate))
+	{
+		if (fill < target)
+			return;
+		m_i2s_rate = rate;
+		m_i2s_level = fill;
+		m_i2s_timer->adjust(attotime::from_hz(rate), 0, attotime::from_hz(rate));
+	}
+
+	if (fill > (target * I2S_HIGH))
+	{
+		s_qemu.i2s_skip(fill - target);
+		fill = target;
+		m_i2s_level = target;
+	}
+
+	m_i2s_level += (double(fill) - m_i2s_level) / 64.0;
+	double const trim = std::clamp((m_i2s_level - target) / target * I2S_TRIM, -I2S_TRIM, I2S_TRIM);
+	m_i2s_timer->adjust(m_i2s_timer->remaining(), 0, attotime::from_hz(rate * (1.0 + trim)));
+}
+
+
+TIMER_CALLBACK_MEMBER(nextpi_device::i2s_frame)
+{
+	if (!s_qemu.i2s_fill())
+	{
+		m_i2s_timer->adjust(attotime::never);
+		m_i2s_rate = 0.0;
+		return;
+	}
+
+	std::array<s32, 2> const frame = s_qemu.i2s_pop();
+	if (!m_i2s_frame.isnull())
+		m_i2s_frame(frame[0], frame[1]);
 }
 
 
