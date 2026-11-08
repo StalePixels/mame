@@ -20,6 +20,13 @@ public:
 	bool nmi_stackless_r() { return m_stackless; }
 	void nmi_stackless_w(bool data);
 
+	// T80N debug interface (FPGA cpu/readme.txt): one byte of CPU state by
+	// register id 0x00-0x1f.  debug_reg_r only reads, so another thread may
+	// call it; it then sees the state at some point of the running
+	// instruction.  debug_reg_w is for the emulation thread only.
+	u8 debug_reg_r(u8 reg);
+	void debug_reg_w(u8 reg, u8 data);
+
 protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
