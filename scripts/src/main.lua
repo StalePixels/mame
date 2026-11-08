@@ -214,8 +214,8 @@ end
 	}
 
 	-- QEMU for the nextpi card, built by scripts/build-qemu.sh (make target qemu).
-	-- libqemu-mane.a is force-loaded so the linker keeps QEMU's machines and
-	-- devices, which register themselves from constructors. libqemu-mane-deps.a
+	-- libqemu-pinesy.a is force-loaded so the linker keeps QEMU's machines and
+	-- devices, which register themselves from constructors. libqemu-pinesy-deps.a
 	-- holds QEMU's stubs and is linked normally. Each line of link-flags.txt is
 	-- one option, so "-framework X" stays together.
 	if _OPTIONS["targetos"]=="macosx" or _OPTIONS["targetos"]=="linux" then
@@ -226,15 +226,15 @@ end
 		else
 			if _OPTIONS["targetos"]=="macosx" then
 				linkoptions {
-					"-Wl,-force_load," .. qemudir .. "libqemu-mane.a",
+					"-Wl,-force_load," .. qemudir .. "libqemu-pinesy.a",
 				}
 			else
 				linkoptions {
-					"-Wl,--whole-archive " .. qemudir .. "libqemu-mane.a -Wl,--no-whole-archive",
+					"-Wl,--whole-archive " .. qemudir .. "libqemu-pinesy.a -Wl,--no-whole-archive",
 				}
 			end
 			linkoptions {
-				qemudir .. "libqemu-mane-deps.a",
+				qemudir .. "libqemu-pinesy-deps.a",
 			}
 			for line in qemuflags:lines() do
 				if line:sub(1, 2) == "-l" then
