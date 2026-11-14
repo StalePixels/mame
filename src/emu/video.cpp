@@ -797,8 +797,15 @@ void video_manager::update_throttle(attotime emutime)
 		// compute the target real time, in ticks, where we want to be
 		osd_ticks_t target_ticks = m_throttle_last_ticks + real_is_ahead_attoseconds / attoseconds_per_tick;
 
-		// throttle until we read the target, and update real time to match the final time
+		// throttle until we read the target, and update real time to match the final time;
+		// other threads may have the machine while it sleeps (running_machine::emulation_lock_for)
+		auto &hold = machine().emulation_hold();
+		bool const held = hold.owns_lock();
+		if (held)
+			hold.unlock();
 		diff_ticks = throttle_until_ticks(target_ticks) - m_throttle_last_ticks;
+		if (held)
+			hold.lock();
 		m_throttle_last_ticks += diff_ticks;
 		m_throttle_realtime += attotime(0, diff_ticks * attoseconds_per_tick);
 		return;

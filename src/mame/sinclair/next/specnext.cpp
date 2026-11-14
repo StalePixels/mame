@@ -50,6 +50,9 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 
 
 #define LOG_IO      (1U << 1)
@@ -82,6 +85,13 @@ constexpr u8 INT_PRIORITY_NMI      = 15;
 
 // How often the emulation takes what the Pi's SPI slave hands it
 const attotime PI_SPI_POLL = attotime::from_usec(10);
+// Longest the Pi's SPI slave waits for the emulation lock: a timeslice
+// takes far less.  The debugger holds the lock while it has the machine
+// stopped, and the work is then queued.
+constexpr auto PI_SPI_LOCK_WAIT = std::chrono::milliseconds(20);
+// Longest it waits for the CPU to answer a pause or a step: covers a frame
+// at low speed
+constexpr auto PI_SPI_BUS_WAIT = std::chrono::milliseconds(200);
 
 // pi_debug_control_param.vhd states and the work handed to the emulation
 enum : u8 { PI_S_IDLE, PI_S_ERROR, PI_S_A2, PI_S_A1, PI_S_A0, PI_S_L1, PI_S_L0, PI_S_BRAM_R, PI_S_BRAM_W, PI_S_SRAM_R, PI_S_SRAM_W };
@@ -259,10 +269,15 @@ private:
 	void pi_spi_bram_w(u32 addr, u8 data);
 	u8 pi_spi_cpu_reg_r(u8 reg);
 	bool pi_spi_push(u8 kind, u8 a, u8 b);
+	bool pi_spi_sync();
+	void pi_spi_wait_bus();
 	// Pi SPI slave and bus arbiter: emulation thread
 	TIMER_CALLBACK_MEMBER(pi_spi_poll);
+	void pi_spi_apply();
 	void pi_spi_pins_update();
 	void pi_spi_system_w(u8 command);
+	void pi_spi_wake();
+	void pi_spi_live_w(bool live);
 	void dma_busreq_w(int state);
 	void cpu_busack_w(int state);
 	void bus_arbitrate();
@@ -633,9 +648,10 @@ private:
 
 	// Pi SPI slave: the core's spi_slave and pi_debug_control_param.  The
 	// Pi clocks the slave, so its decoder runs on QEMU's thread, inside the
-	// transfer call, and answers at once from the live machine.  What only
-	// the emulation thread can do goes through m_pi_spi_ring, which the Pi
-	// never waits for.  Not saved: QEMU is not part of save states.
+	// transfer call, and answers at once from the live machine.  Work that
+	// changes the machine goes through m_pi_spi_ring, and is made at once
+	// under the emulation lock (pi_spi_sync), or by pi_spi_poll if the lock
+	// does not come.  Not saved: QEMU is not part of save states.
 	bool m_pi_spi_fitted; // g_option(4)
 	bool m_pi_spi_host = false; // the rs232_rpi card has the SPI interface
 	emu_timer *m_pi_spi_timer = nullptr;
@@ -664,8 +680,12 @@ private:
 	std::array<std::array<u8, 3>, 4096> m_pi_spi_ring;
 	std::atomic<u32> m_pi_spi_head = 0;
 	std::atomic<u32> m_pi_spi_tail = 0;
+	std::atomic<bool> m_pi_spi_live = false; // the machine runs: work can be made under the emulation lock
+	std::atomic<bool> m_pi_spi_waiting = false;
+	std::mutex m_pi_spi_mutex;
+	std::condition_variable m_pi_spi_cv;
 
-	// emulation thread only
+	// emulation thread, or QEMU's thread with the emulation lock
 	u8 m_pi_spi_nmi; // u2: SYSTEM NMI pulse, as the NMI buttons
 	bool m_pi_spi_nr_w;
 
@@ -3188,15 +3208,21 @@ void specnext_state::nmi_rq()
 // core's SRAM port C and block RAM ports do: the Pi is never refused a
 // cycle, so no byte is late.
 //
-// Timing: the slave works outside the machine's clock domain and is only
-// frame-level accurate. It runs on QEMU's thread, not in emulated time:
-// reads see the state wherever emulation has reached, which is frozen at
-// the end of the last frame while MAME waits for real time, and memory
-// writes land at no defined emulated time. NextReg writes, CPU control,
-// register writes and SYSTEM commands are queued and take effect when the
-// emulation next runs (pi_spi_poll), up to a frame later. QEMU does not
-// pace the bytes by the SPI clock, so transfers run faster than the core's
-// SPI clock allows.
+// Timing: the slave works outside the machine's clock domain. It runs on
+// QEMU's thread, not in emulated time: reads see the state wherever
+// emulation has reached, which is frozen at the end of the last frame while
+// MAME waits for real time, and memory writes land at no defined emulated
+// time. In the core, NextReg writes, register writes, SYSTEM commands and
+// CPU pause, resume and step act a few 28 MHz clocks after their byte,
+// before the next byte can start. Here they are made before the byte is
+// answered, on QEMU's thread under the emulation lock
+// (running_machine::emulation_lock_for), at the emulation's last timeslice
+// boundary. While the machine is paused or the debugger has it stopped
+// they are queued for pi_spi_poll instead. The CPU answers a pause or a
+// step only when the emulation runs, so the slave waits for that before it
+// answers the byte, up to a frame in real time. QEMU does not pace the
+// bytes by the SPI clock, so transfers run faster than the core's SPI
+// clock allows.
 
 void specnext_state::pi_spi_select_w(int state)
 {
@@ -3282,6 +3308,38 @@ bool specnext_state::pi_spi_push(u8 kind, u8 a, u8 b)
 	m_pi_spi_ring[head % m_pi_spi_ring.size()] = { kind, a, b };
 	m_pi_spi_head.store(head + 1, std::memory_order_release);
 	return true;
+}
+
+// Make the queued work and the bus request now, between two of the
+// emulation's timeslices.  False if the machine is not running or the lock
+// did not come: pi_spi_poll makes the work later.
+bool specnext_state::pi_spi_sync()
+{
+	const auto lock = machine().emulation_lock_for(PI_SPI_LOCK_WAIT);
+	if (!lock.owns_lock() || !m_pi_spi_live.load())
+		return false;
+	pi_spi_apply();
+	return true;
+}
+
+// Wait until the CPU has done what bus_control asks: in the core the CPU
+// answers busrq within an instruction, so busrq_status (pi_debug_control_param.vhd
+// 858-869) shows 10 (paused) or 00 (running) by the next byte.  A single
+// step (11) ends when the CPU has taken the bus back for one instruction
+// and given it up again (lines 845-850): 10.
+void specnext_state::pi_spi_wait_bus()
+{
+	m_pi_spi_waiting.store(true);
+	std::unique_lock<std::mutex> lock(m_pi_spi_mutex);
+	m_pi_spi_cv.wait_for(lock, PI_SPI_BUS_WAIT, [this] ()
+	{
+		if (!m_pi_spi_live.load())
+			return true;
+		const u8 bus = m_pi_spi_bus.load();
+		const bool busak = m_pi_busak.load();
+		return (bus == 0b01 && !busak) || (bus == 0b00 && busak);
+	});
+	m_pi_spi_waiting.store(false);
 }
 
 u8 specnext_state::pi_spi_byte(u8 mosi)
@@ -3418,28 +3476,36 @@ u8 specnext_state::pi_spi_byte(u8 mosi)
 		case 0x1: m_pi_spi_di = 0xff; break; // g_option(12 downto 5) on issue 4 and 5
 		case 0x2: m_pi_spi_di = 0x00; break; // hotkeys: MAME has no QWERT tape keys
 		case 0xc:
+			// nextreg_wr_control (pi_debug_control_param.vhd 1121-1125) writes
+			// at once, after copper and Z80 (zxnext.vhd 5331-5335)
 			m_pi_spi_di = mosi;
-			pi_spi_push(PI_DO_NR_W, m_pi_spi_a & 0xff, mosi);
+			if (pi_spi_push(PI_DO_NR_W, m_pi_spi_a & 0xff, mosi))
+				pi_spi_sync();
 			break;
 		case 0xd: m_pi_spi_di = pi_spi_cpu_reg_r(m_pi_spi_a & 0x1f); break;
 		case 0xe:
 			m_pi_spi_di = mosi;
 			if (pi_spi_push(PI_DO_CPU_REG_W, m_pi_spi_a & 0x1f, mosi))
 			{
+				// cpu_wr_control (pi_debug_control_param.vhd 1141-1153)
 				m_pi_cpu_wr_val[m_pi_spi_a & 0x1f] = mosi;
 				m_pi_cpu_wr_seq[m_pi_spi_a & 0x1f] = m_pi_spi_head.load(std::memory_order_relaxed);
+				pi_spi_sync();
 			}
 			break;
 		}
 	}
 	else if (state == PI_S_L0 && r == 0x3)
 	{
-		pi_spi_push(PI_DO_SYSTEM, BIT(mosi, 0, 5), 0);
+		// a pulse on the clock after the byte (pi_debug_control_param.vhd 796-806)
+		if (pi_spi_push(PI_DO_SYSTEM, BIT(mosi, 0, 5), 0))
+			pi_spi_sync();
 	}
 	else if (state == PI_S_IDLE)
 	{
 		// bus_control (pi_debug_control_param.vhd 818-868).  The emulation
 		// moves it from 11 to 00 when the CPU has taken the bus back.
+		// The bus request is made at once, as the core's busrq_n (line 1167).
 		u8 bus = m_pi_spi_bus.load();
 		if (cmd == 0x5)
 			m_pi_spi_bus.store(0b01);
@@ -3447,6 +3513,8 @@ u8 specnext_state::pi_spi_byte(u8 mosi)
 			m_pi_spi_bus.compare_exchange_strong(bus, 0b00);
 		else if (cmd == 0x6 && bus == 0b00 && m_pi_busak.load())
 			m_pi_spi_bus.compare_exchange_strong(bus, 0b11);
+		if ((cmd == 0x4 || cmd == 0x5 || cmd == 0x6) && pi_spi_sync())
+			pi_spi_wait_bus();
 	}
 
 	m_pi_spi_state = next;
@@ -3472,10 +3540,18 @@ void specnext_state::pi_spi_pins_update()
 	m_pi_spi_pins.store(pins);
 }
 
+TIMER_CALLBACK_MEMBER(specnext_state::pi_spi_poll)
+{
+	pi_spi_apply();
+	if (!m_pi_spi_live.load())
+		pi_spi_live_w(true);
+}
+
 // Take what the slave has handed over, then follow its bus request.
 // bus_control is read first: everything the Pi sent before it is then in
 // the ring, so register writes land before a resume releases the CPU.
-TIMER_CALLBACK_MEMBER(specnext_state::pi_spi_poll)
+// The emulation thread, or QEMU's thread with the emulation lock.
+void specnext_state::pi_spi_apply()
 {
 	const u8 bus = m_pi_spi_bus.load();
 	const u32 head = m_pi_spi_head.load(std::memory_order_acquire);
@@ -3502,6 +3578,25 @@ TIMER_CALLBACK_MEMBER(specnext_state::pi_spi_poll)
 
 	m_pi_busrq = !BIT(bus, 0);
 	bus_arbitrate();
+	pi_spi_wake();
+}
+
+// Wake the Pi's SPI slave if it waits for the emulation
+void specnext_state::pi_spi_wake()
+{
+	std::atomic_thread_fence(std::memory_order_seq_cst);
+	if (m_pi_spi_waiting.load())
+	{
+		std::lock_guard<std::mutex> lock(m_pi_spi_mutex);
+		m_pi_spi_cv.notify_all();
+	}
+}
+
+void specnext_state::pi_spi_live_w(bool live)
+{
+	m_pi_spi_live.store(live);
+	std::lock_guard<std::mutex> lock(m_pi_spi_mutex);
+	m_pi_spi_cv.notify_all();
 }
 
 // Each bit is a one-clock pulse, as the F key it shares with the hotkeys
@@ -3588,6 +3683,7 @@ void specnext_state::bus_ack_update()
 	}
 	m_pi_busak.store((m_bus_owner == BUS_PI) && m_cpu_busack);
 	m_dma_busak.store(dma);
+	pi_spi_wake();
 }
 
 void specnext_state::leave_nmi(int state)
@@ -4204,6 +4300,19 @@ void specnext_state::machine_start()
 	m_pi_ram = m_ram->pointer();
 	m_pi_ram_size = m_ram->size();
 	m_pi_spi_timer = timer_alloc(FUNC(specnext_state::pi_spi_poll), this);
+	// QEMU's thread makes work under the emulation lock only while the
+	// machine runs: pi_spi_poll starts it, inside a timeslice.  Exit
+	// notifiers run before the devices stop, so QEMU's thread has let go
+	// before the rs232_rpi card detaches.
+	machine().add_notifier(MACHINE_NOTIFY_PAUSE, machine_notify_delegate([this] () { pi_spi_live_w(false); }));
+	machine().add_notifier(MACHINE_NOTIFY_EXIT, machine_notify_delegate([this] ()
+	{
+		// wait for work QEMU's thread is making under the emulation lock
+		std::unique_lock<std::timed_mutex> lock;
+		if (!machine().emulation_hold().owns_lock())
+			lock = machine().emulation_lock_for(std::chrono::seconds(10));
+		pi_spi_live_w(false);
+	}));
 	m_pi_spi_nmi = 0;
 	m_pi_spi_nr_w = false;
 	m_pi_busrq = false;
