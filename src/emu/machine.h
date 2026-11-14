@@ -17,7 +17,10 @@
 #ifndef MAME_EMU_MACHINE_H
 #define MAME_EMU_MACHINE_H
 
+#include <atomic>
+#include <chrono>
 #include <functional>
+#include <mutex>
 
 #include <ctime>
 
@@ -147,6 +150,21 @@ public:
 	const std::string &basename() const { return m_basename; }
 	int sample_rate() const { return m_sample_rate; }
 	bool save_or_load_pending() const { return !m_saveload_pending_file.empty(); }
+
+	// The emulation lock.  The emulation thread holds it while it runs a
+	// timeslice or a save or load, and lets go of it while the throttle
+	// sleeps.  A thread of an emulator linked into the process (Pinesy's
+	// QEMU) takes it to see and change the machine between timeslices.
+	// The holder must never wait for the emulation thread.
+	template <typename Rep, typename Period>
+	std::unique_lock<std::timed_mutex> emulation_lock_for(std::chrono::duration<Rep, Period> const &timeout)
+	{
+		m_emulation_waiters.fetch_add(1);
+		std::unique_lock<std::timed_mutex> lock(m_emulation_mutex, timeout);
+		m_emulation_waiters.fetch_sub(1);
+		return lock;
+	}
+	std::unique_lock<std::timed_mutex> &emulation_hold() { return m_emulation_hold; }
 
 	// RAII-based side effect disable
 	// NOP-ed when passed false, to make it more easily conditional
@@ -295,6 +313,9 @@ private:
 	bool                    m_hard_reset_pending;   // is a hard reset pending?
 	bool                    m_exit_pending;         // is an exit pending?
 	emu_timer *             m_soft_reset_timer;     // timer used to schedule a soft reset
+	std::timed_mutex        m_emulation_mutex;      // see emulation_lock_for
+	std::unique_lock<std::timed_mutex> m_emulation_hold{ m_emulation_mutex, std::defer_lock }; // the emulation thread's hold
+	std::atomic<int>        m_emulation_waiters = 0; // other threads waiting for the lock
 
 	// misc state
 	u32                     m_rand_seed;            // current random number seed
