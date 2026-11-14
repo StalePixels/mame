@@ -44,6 +44,7 @@
 
 #include <ctime>
 #include <locale>
+#include <thread>
 
 #if defined(__EMSCRIPTEN__)
 #include <emscripten.h>
@@ -435,6 +436,12 @@ int running_machine::run(bool quiet)
 		{
 			auto profile = g_profiler.start(PROFILER_EXTRA);
 
+			// let a thread waiting for the emulation lock in before the next
+			// timeslice: the mutex is not fair
+			while (m_emulation_waiters.load())
+				std::this_thread::yield();
+			m_emulation_hold.lock();
+
 			// execute CPUs if not paused
 			if (!m_paused)
 				m_scheduler.timeslice();
@@ -448,6 +455,8 @@ int running_machine::run(bool quiet)
 			// handle save/load
 			if (m_saveload_schedule != saveload_schedule::NONE)
 				handle_saveload();
+
+			m_emulation_hold.unlock();
 		}
 		m_manager.http()->clear();
 
