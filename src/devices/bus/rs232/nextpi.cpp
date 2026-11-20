@@ -28,6 +28,11 @@
     answers QEMU before it returns, so the Pi never waits for the
     emulation thread.
 
+    With -pi_gdb_port, an option that Pinesy's OSD adds, QEMU's own GDB
+    stub listens on that port at -debugger_host.  With -pi_gdb_wait, the
+    Pi waits at its first instruction (QEMU -S) until a GDB client or
+    Pinesy continues it.
+
     QEMU can only be started once per process.  It keeps running through
     hard resets and stops when the process exits.  Pi state is not part
     of save states.
@@ -50,6 +55,7 @@ extern "C" {
 #include "../../../../../vendor/rpi-utils/dtmerge/dtoverlay.h"
 }
 
+#include "emuopts.h"
 #include "multibyte.h"
 
 #include "corefile.h"
@@ -63,6 +69,7 @@ extern "C" {
 #include <cerrno>
 #include <cstdarg>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -73,6 +80,8 @@ extern "C" {
 #include <vector>
 
 #include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -118,7 +127,9 @@ public:
 	int fd() const { return m_fd; }
 	std::vector<std::string> const &args() const { return m_args; }
 
-	std::string start(std::string const &image, std::vector<u8> const &kernel, std::vector<u8> const &initrd, std::vector<u8> const &dtb, std::vector<u8> const &cmdline);
+	// gdb is QEMU's -gdb device, empty for no GDB stub; gdb_wait holds the
+	// Pi at its first instruction until it is continued
+	std::string start(std::string const &image, std::vector<u8> const &kernel, std::vector<u8> const &initrd, std::vector<u8> const &dtb, std::vector<u8> const &cmdline, std::string const &gdb, bool gdb_wait);
 
 	// I2S frames from the Pi, for the emulation thread
 	double i2s_rate() const { return m_i2s_rate.load(std::memory_order_relaxed); }
@@ -504,7 +515,50 @@ std::string dt_merge(device_t const &dev, util::random_read &image, u64 offset, 
 }
 
 
-std::string nextpi_qemu::start(std::string const &image, std::vector<u8> const &kernel, std::vector<u8> const &initrd, std::vector<u8> const &dtb, std::vector<u8> const &cmdline)
+// QEMU's -gdb tcp:host:port listens on every address of host that it
+// can bind, and calls exit() only when it binds none.  Every address of
+// host must be free, or a client may reach another program.
+std::string gdb_port_check(char const *host, int port)
+{
+	if ((port < 1) || (port > 65535))
+		return util::string_format("Pi GDB port %d is not between 1 and 65535", port);
+
+	addrinfo hints;
+	std::memset(&hints, 0, sizeof(hints));
+	hints.ai_flags = AI_PASSIVE;
+	hints.ai_socktype = SOCK_STREAM;
+	addrinfo *res = nullptr;
+	std::string const service = std::to_string(port);
+	int const rc = ::getaddrinfo(*host ? host : nullptr, service.c_str(), &hints, &res);
+	if (rc)
+		return util::string_format("cannot find the address of %s for the Pi GDB port: %s", host, ::gai_strerror(rc));
+
+	std::string err;
+	for (addrinfo const *e = res; e && err.empty(); e = e->ai_next)
+	{
+		int const sock = ::socket(e->ai_family, e->ai_socktype, e->ai_protocol);
+		if (sock < 0)
+			continue; // QEMU skips an address family the system does not have
+		int const one = 1;
+		::setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+		if (e->ai_family == AF_INET6)
+			::setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one));
+		if (::bind(sock, e->ai_addr, e->ai_addrlen) || ::listen(sock, 1))
+		{
+			int const binderr = errno;
+			char addr[NI_MAXHOST];
+			if (::getnameinfo(e->ai_addr, e->ai_addrlen, addr, sizeof(addr), nullptr, 0, NI_NUMERICHOST))
+				std::snprintf(addr, sizeof(addr), "%s", host);
+			err = util::string_format("cannot use Pi GDB port %d on %s: %s", port, addr, std::strerror(binderr));
+		}
+		::close(sock);
+	}
+	::freeaddrinfo(res);
+	return err;
+}
+
+
+std::string nextpi_qemu::start(std::string const &image, std::vector<u8> const &kernel, std::vector<u8> const &initrd, std::vector<u8> const &dtb, std::vector<u8> const &cmdline, std::string const &gdb, bool gdb_wait)
 {
 	std::error_code ec;
 	std::filesystem::path const folder = std::filesystem::temp_directory_path(ec) / util::string_format("pinesy-pi-%d", int(::getpid()));
@@ -565,6 +619,13 @@ std::string nextpi_qemu::start(std::string const &image, std::vector<u8> const &
 		m_args.emplace_back("-dtb");
 		m_args.emplace_back((folder / "bcm2708-rpi-zero.dtb").string());
 	}
+	if (!gdb.empty())
+	{
+		m_args.emplace_back("-gdb");
+		m_args.emplace_back(gdb);
+	}
+	if (gdb_wait)
+		m_args.emplace_back("-S");
 	for (std::string &arg : m_args)
 		m_argv.push_back(arg.data());
 	m_argv.push_back(nullptr);
@@ -804,7 +865,23 @@ std::pair<std::error_condition, std::string> nextpi_device::call_load()
 				return std::make_pair(image_error::INVALIDIMAGE, dterr);
 		}
 
-		std::string const msg = s_qemu.start(path, kernel, initrd, dtb, cmdline);
+		// Pinesy's OSD adds the Pi GDB options (engine/osd/pinesyopts.h)
+		std::string gdb;
+		bool gdb_wait = false;
+		emu_options const &options = machine().options();
+		if (options.exists("pi_gdb_port") && options.int_value("pi_gdb_port"))
+		{
+			int const port = options.int_value("pi_gdb_port");
+			if ((machine().debug_flags & DEBUG_FLAG_ENABLED) && !std::strcmp(options.value("debugger"), "gdbstub") && (port == options.int_value("debugger_port")))
+				return std::make_pair(image_error::UNSPECIFIED, util::string_format("Pi GDB port %d is the Next's GDB port; give the Pi another port", port));
+			std::string const porterr = gdb_port_check(options.value("debugger_host"), port);
+			if (!porterr.empty())
+				return std::make_pair(image_error::UNSPECIFIED, porterr);
+			gdb = util::string_format("tcp:%s:%d", options.value("debugger_host"), port);
+		}
+		gdb_wait = options.exists("pi_gdb_wait") && options.bool_value("pi_gdb_wait");
+
+		std::string const msg = s_qemu.start(path, kernel, initrd, dtb, cmdline, gdb, gdb_wait);
 		if (!msg.empty())
 			return std::make_pair(image_error::UNSPECIFIED, msg);
 
