@@ -28,16 +28,21 @@ debugger console, see :ref:`debugger`) are supported.
 Session lifecycle
 -----------------
 
-The stub listens for a single TCP connection and serves one debug
-session per MAME run.  This follows the remote serial protocol's
-model of a single controlling debugger, and the listening socket is
-closed once the first connection is accepted:
+The stub listens for one TCP connection at a time.  While a client is
+connected, the port accepts no other connection.  When the session
+ends, the stub listens on the same address and port again, so a new
+client can connect, as often as needed during one MAME run:
 
-* After the client disconnects, the stub does not accept new
-  connections; restart MAME for another session.
+* A client that connects while the emulated system runs stops it, as
+  GDB expects in all-stop mode.  GDB then reads the stop reason with
+  ``?``.
 * GDB's ``detach`` resumes the emulated system and leaves MAME
-  running.  The connection is closed once the reply is flushed, so the
-  port is free for a new listener (e.g. another MAME instance).
+  running.  The connection is closed once the reply is sent, and the
+  stub listens again.
+* If the client closes the connection without a ``detach``, the stub
+  resumes the emulated system and listens again.  Breakpoints and
+  watchpoints that the client did not remove stay set.  When one is
+  hit, the system stops and waits for a client.
 * GDB's ``kill`` (sent automatically in some batch/exit paths) makes
   MAME exit.
 
@@ -169,9 +174,9 @@ complete register set GDB's architecture support looks for --
 unrecognized architecture -- which is why it comes first, and the extra
 device registers ride along as features after it.
 
-The register list is built at connect time from the state entries the
-devices actually implement: an entry that does not exist is skipped,
-and the registers after it shift down in numbering.  Until GDB has
+The register list is built when the system starts, from the state
+entries the devices actually implement: an entry that does not exist is
+skipped, and the registers after it shift down in numbering.  Until GDB has
 fetched the description the stub leaves ``g``/``G``/``p``/``P``
 unanswered -- GDB probes registers before reading it, and regnums it
 does not know yet would be misdecoded.
