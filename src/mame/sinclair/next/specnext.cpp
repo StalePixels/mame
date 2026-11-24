@@ -521,6 +521,7 @@ private:
 	bool m_nr_06_internal_speaker_beep;
 	bool m_nr_06_hotkey_cpu_speed_en;
 	u8 m_nr_07_cpu_speed; // u2
+	bool m_nr_07_cpu_turbo;
 	bool m_nr_08_keyboard_issue2;
 	bool m_nr_08_psg_turbosound_en;
 	bool m_nr_08_port_ff_rd_en;
@@ -1812,7 +1813,7 @@ u8 specnext_state::nr_rd(offs_t nr_register)
 		{
 			u8 cpu_speed = 0;
 			for (u8 clock_scale = BIT(u8(m_maincpu->clock_scale()), 0, 4) >> 1; clock_scale; clock_scale >>= 1, ++cpu_speed);
-			port_253b_dat = (0b00 << 6) | (cpu_speed << 4) | (0b00 << 2) | m_nr_07_cpu_speed;
+			port_253b_dat = (0b00 << 6) | (cpu_speed << 4) | (0b0 << 3) | ((core_30303() && m_nr_07_cpu_turbo) << 2) | m_nr_07_cpu_speed;
 		}
 		break;
 	case 0x08:
@@ -2322,7 +2323,7 @@ void specnext_state::reg_w(offs_t nr_wr_reg, u8 nr_wr_dat)
 		ear_update(false);
 		break;
 	case 0x07:
-		nr_07_cpu_speed_w(BIT(nr_wr_dat, 0, 2));
+		nr_07_cpu_speed_w(BIT(nr_wr_dat, 0, 3));
 		break;
 	case 0x08:
 		m_nr_08_contention_disable = BIT(nr_wr_dat, 6);
@@ -2938,6 +2939,9 @@ void specnext_state::nr_02_w(u8 nr_wr_dat)
 void specnext_state::nr_07_cpu_speed_w(u8 data)
 {
 	m_nr_07_cpu_speed = data & 3;
+	m_nr_07_cpu_turbo = BIT(data, 2);
+	// Core 3.03.03 turbo: bit 2 only takes effect at 28MHz
+	m_maincpu->turbo_w(core_30303() && (m_nr_07_cpu_speed == 0b11) && m_nr_07_cpu_turbo);
 	m_maincpu->set_clock_scale(1 << m_nr_07_cpu_speed);
 	m_dma->set_clock_scale(1 << m_nr_07_cpu_speed);
 	m_im2_line->set_clock_scale(1 << m_nr_07_cpu_speed);
@@ -4393,6 +4397,7 @@ void specnext_state::machine_start()
 	save_item(NAME(m_nr_06_internal_speaker_beep));
 	save_item(NAME(m_nr_06_hotkey_cpu_speed_en));
 	save_item(NAME(m_nr_07_cpu_speed));
+	save_item(NAME(m_nr_07_cpu_turbo));
 	save_item(NAME(m_nr_08_keyboard_issue2));
 	save_item(NAME(m_nr_08_psg_turbosound_en));
 	save_item(NAME(m_nr_08_port_ff_rd_en));

@@ -11,6 +11,27 @@ macro   nomreq_addr   %addr
 macro   nomreq_ir   %cycles
 	%cycles * @nomreq_addr (m_i << 8) | (m_r2 & 0x80) | (m_r & 0x7f)
 
+# Internal cycles that the Z80N leaves out in turbo mode (nextreg $07 bit 2
+# at 28MHz on core 3.03.03), for the opcodes in TURBO_OPCODES (z80n.cpp).
+# Every other CPU runs them as plain cycles.
+macro   nomreq_addr_turbo   %cycles %addr
+	%cycles * @nomreq_addr %addr
+
+macro   z80n:nomreq_addr_turbo   %cycles %addr
+	if (!m_turbo_op) {
+		%cycles * @nomreq_addr %addr
+		;
+	}
+
+macro   nomreq_ir_turbo   %cycles
+	@nomreq_ir %cycles
+
+macro   z80n:nomreq_ir_turbo   %cycles
+	if (!m_turbo_op) {
+		@nomreq_ir %cycles
+		;
+	}
+
 macro   in   %port
 	m_iorq_cycles !! TDAT8 = m_io.read_interruptible(%port);
 
@@ -22,7 +43,7 @@ macro   rm   %addr
 
 macro   rm_reg   %addr
 	@rm %addr
-	@nomreq_addr %addr
+	@nomreq_addr_turbo 1, %addr
 
 macro   rm16   %addr
 	m_mreq_cycles !! TDAT_L = data_read(%addr);
@@ -123,7 +144,8 @@ macro   t6a84:jp_cond   %cond
 
 macro   jr
 	@arg
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	PC += (s8)TDAT8;
 	WZ = PC;
 
@@ -149,7 +171,7 @@ macro   jr_cond   %cond
 
 macro   arg16_call
 	@arg16 m_ea
-	@nomreq_addr PC-1
+	@nomreq_addr_turbo 1, PC-1
 	WZ = m_ea;
 	@wm16_sp PC
 	PC = m_ea;
@@ -169,7 +191,7 @@ macro   call_cond   %cond
 	}
 
 macro   ret_cond   %cond
-	@nomreq_ir 1
+	@nomreq_ir_turbo 1
 	if (%cond) {
 		@pop
 		PC = TDAT;
@@ -215,7 +237,7 @@ macro   t6a84:reti
 	daisy_call_reti_device();
 
 macro   ld_r_a
-	@nomreq_ir 1
+	@nomreq_ir_turbo 1
 	m_r = A;
 	m_r2 = A & 0x80; // keep bit 7 of r
 
@@ -224,7 +246,7 @@ macro   r800:ld_r_a
 	m_r2 = A & 0x80; // keep bit 7 of r
 
 macro   ld_a_r
-	@nomreq_ir 1
+	@nomreq_ir_turbo 1
 	A = (m_r & 0x7f) | m_r2;
 	{
 		QT = 0;
@@ -251,14 +273,14 @@ macro   r800:ld_a_r
 		set_service_attention<SA_AFTER_LDAIR, 1>();
 
 macro   ld_i_a
-	@nomreq_ir 1
+	@nomreq_ir_turbo 1
 	m_i = A;
 
 macro   r800:ld_i_a
 	m_i = A;
 
 macro   ld_a_i
-	@nomreq_ir 1
+	@nomreq_ir_turbo 1
 	A = m_i;
 	{
 		QT = 0;
@@ -292,7 +314,8 @@ macro   rst	 addr
 macro   rrd
 	@rm HL
 	WZ = HL+1;
-	4 * @nomreq_addr HL
+	3 * @nomreq_addr HL
+	@nomreq_addr_turbo 1, HL
 	TDAT_H = TDAT8;
 	TDAT8 = (TDAT8 >> 4) | (A << 4);
 	@wm HL
@@ -308,7 +331,8 @@ macro   rrd
 macro   rld
 	@rm HL
 	WZ = HL+1;
-	4 * @nomreq_addr HL
+	3 * @nomreq_addr HL
+	@nomreq_addr_turbo 1, HL
 	TDAT_H = TDAT8;
 	TDAT8 = (TDAT8 << 4) | (A & 0x0f);
 	@wm HL
@@ -326,12 +350,13 @@ macro   ex_sp   %dd
 	@nomreq_addr SP-1
 	@wm16_sp %dd
 	%dd = TDAT;
-	2 * @nomreq_addr SP
+	@nomreq_addr_turbo 2, SP
 	WZ = TDAT;
 
 macro   add16   %dd1 %dd2
 {
-	@nomreq_ir 7
+	@nomreq_ir 6
+	@nomreq_ir_turbo 1
 	const u32 res = %dd1 + %dd2;
 	WZ = %dd1 + 1;
 	{
@@ -362,7 +387,8 @@ macro   r800:add16   %dd1 %dd2
 
 macro   adc_hl   %dd
 {
-	@nomreq_ir 7
+	@nomreq_ir 6
+	@nomreq_ir_turbo 1
 	const u32 res = HL + %dd + m_f.c;
 	WZ = HL + 1;
 	{
@@ -395,7 +421,8 @@ macro   r800:adc_hl   %dd
 
 macro   sbc_hl   %dd
 {
-	@nomreq_ir 7
+	@nomreq_ir 6
+	@nomreq_ir_turbo 1
 	u32 res = HL - %dd - m_f.c;
 	WZ = HL + 1;
 	{
@@ -429,7 +456,7 @@ macro   r800:sbc_hl   %dd
 macro   ldi
 	@rm HL
 	@wm DE
-	2 * @nomreq_addr DE
+	@nomreq_addr_turbo 2, DE
 	HL++;
 	DE++;
 	BC--;
@@ -459,7 +486,8 @@ macro   r800:ldi
 macro   cpi
 {
 	@rm HL
-	5 * @nomreq_addr HL
+	3 * @nomreq_addr HL
+	@nomreq_addr_turbo 2, HL
 	WZ++;
 	HL++;
 	BC--;
@@ -500,7 +528,7 @@ macro   r800:cpi
 
 macro   ini
 {
-	@nomreq_ir 1
+	@nomreq_ir_turbo 1
 	@in BC
 	WZ = BC + 1;
 	B--;
@@ -539,7 +567,7 @@ macro   r800:ini
 
 macro   outi
 {
-	@nomreq_ir 1
+	@nomreq_ir_turbo 1
 	@rm HL
 	B--;
 	WZ = BC + 1;
@@ -580,7 +608,7 @@ macro   ldd
 {
 	@rm HL
 	@wm DE
-	2 * @nomreq_addr DE
+	@nomreq_addr_turbo 2, DE
 	HL--;
 	DE--;
 	BC--;
@@ -613,7 +641,8 @@ macro   r800:ldd
 macro   cpd
 {
 	@rm HL
-	5 * @nomreq_addr HL
+	3 * @nomreq_addr HL
+	@nomreq_addr_turbo 2, HL
 	WZ--;
 	HL--;
 	BC--;
@@ -654,7 +683,7 @@ macro   r800:cpd
 
 macro   ind
 {
-	@nomreq_ir 1
+	@nomreq_ir_turbo 1
 	@in BC
 	WZ = BC - 1;
 	B--;
@@ -693,7 +722,7 @@ macro   r800:ind
 
 macro   outd
 {
-	@nomreq_ir 1
+	@nomreq_ir_turbo 1
 	@rm HL
 	B--;
 	WZ = BC - 1;
@@ -733,7 +762,8 @@ macro   r800:outd
 macro   ldir
 	@ldi
 	if (BC != 0) {
-		5 * @nomreq_addr DE
+		3 * @nomreq_addr DE
+		@nomreq_addr_turbo 2, DE
 		PC -= 2;
 		WZ = PC + 1;
 		m_f.yx_val = PC >> 8;
@@ -751,7 +781,8 @@ macro   r800:ldir
 macro   cpir
 	@cpi
 	if (BC != 0 && !m_f.z()) {
-		5 * @nomreq_addr HL
+		3 * @nomreq_addr HL
+		@nomreq_addr_turbo 2, HL
 		PC -= 2;
 		WZ = PC + 1;
 		m_f.yx_val = PC >> 8;
@@ -769,7 +800,8 @@ macro   r800:cpir
 macro   inir
 	@ini
 	if (B != 0) {
-		5 * @nomreq_addr HL
+		3 * @nomreq_addr HL
+		@nomreq_addr_turbo 2, HL
 		PC -= 2;
 		block_io_interrupted_flags();
 	}
@@ -788,7 +820,8 @@ macro   r800:inir
 macro   otir
 	@outi
 	if (B != 0) {
-		5 * @nomreq_addr BC
+		3 * @nomreq_addr BC
+		@nomreq_addr_turbo 2, BC
 		PC -= 2;
 		block_io_interrupted_flags();
 	}
@@ -808,7 +841,8 @@ macro   r800:otir
 macro   lddr
 	@ldd
 	if (BC != 0) {
-		5 * @nomreq_addr DE
+		3 * @nomreq_addr DE
+		@nomreq_addr_turbo 2, DE
 		PC -= 2;
 		WZ = PC + 1;
 		m_f.yx_val = PC >> 8;
@@ -826,7 +860,8 @@ macro   r800:lddr
 macro   cpdr
 	@cpd
 	if (BC != 0 && !m_f.z()) {
-		5 * @nomreq_addr HL
+		3 * @nomreq_addr HL
+		@nomreq_addr_turbo 2, HL
 		PC -= 2;
 		WZ = PC + 1;
 		m_f.yx_val = PC >> 8;
@@ -844,7 +879,8 @@ macro   r800:cpdr
 macro   indr
 	@ind
 	if (B != 0) {
-		5 * @nomreq_addr HL
+		3 * @nomreq_addr HL
+		@nomreq_addr_turbo 2, HL
 		PC -= 2;
 		block_io_interrupted_flags();
 	}
@@ -863,7 +899,8 @@ macro   r800:indr
 macro   otdr
 	@outd
 	if (B != 0) {
-		5 * @nomreq_addr BC
+		3 * @nomreq_addr BC
+		@nomreq_addr_turbo 2, BC
 		PC -= 2;
 		block_io_interrupted_flags();
 	}
@@ -885,6 +922,16 @@ macro   jump	%po
 
 macro   jump_prefixed   %prefix
 	m_ref = (%prefix << 16) | (TDAT8 << 8);
+	goto process;
+
+macro   z80n:jump	%po
+	m_ref = 0x%po00;
+	m_turbo_op = false;
+	goto process;
+
+macro   z80n:jump_prefixed   %prefix
+	m_ref = (%prefix << 16) | (TDAT8 << 8);
+	m_turbo_op = m_turbo && turbo_opcode((%prefix << 8) | TDAT8);
 	goto process;
 
 macro   take_nmi
@@ -1096,8 +1143,7 @@ ffff
 	PRVPC = PC;
 	debugger_instruction_hook(PC);
 	@rop
-	m_ref = (0x00 << 16) | (TDAT8 << 8);
-	goto process;
+	@jump_prefixed 0x00
 
 
 ##########################################################
@@ -3405,7 +3451,7 @@ dd22	# LD   (w),IX
 	WZ = m_ea + 1;
 
 dd23	# INC  IX
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	IX++;
 
 dd24	# INC  HX
@@ -3436,7 +3482,7 @@ dd2a	# LD   IX,(w)
 	WZ = m_ea + 1;
 
 dd2b	# DEC  IX
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	IX--;
 
 dd2c	# INC  LX
@@ -3471,14 +3517,16 @@ dd33	# DB   DD
 
 dd34	# INC  (IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm_reg m_ea
 	inc(TDAT8);
 	@wm m_ea
 
 dd35	# DEC  (IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm_reg m_ea
 	dec(TDAT8);
 	@wm m_ea
@@ -3486,7 +3534,7 @@ dd35	# DEC  (IX+o)
 dd36	# LD   (IX+o),n
 	@eax
 	@arg
-	2 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@wm m_ea
 
 dd37	# DB   DD
@@ -3548,7 +3596,8 @@ dd45	# LD   B,LX
 
 dd46	# LD   B,(IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	B = TDAT8;
 
@@ -3580,7 +3629,8 @@ dd4d	# LD   C,LX
 
 dd4e	# LD   C,(IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	C = TDAT8;
 
@@ -3612,7 +3662,8 @@ dd55	# LD   D,LX
 
 dd56	# LD   D,(IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	D = TDAT8;
 
@@ -3644,7 +3695,8 @@ dd5d	# LD   E,LX
 
 dd5e	# LD   E,(IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	E = TDAT8;
 
@@ -3671,7 +3723,8 @@ dd65	# LD   HX,LX
 
 dd66	# LD   H,(IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	H = TDAT8;
 
@@ -3697,7 +3750,8 @@ dd6d	# LD   LX,LX
 
 dd6e	# LD   L,(IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	L = TDAT8;
 
@@ -3706,37 +3760,43 @@ dd6f	# LD   LX,A
 
 dd70	# LD   (IX+o),B
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = B;
 	@wm m_ea
 
 dd71	# LD   (IX+o),C
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = C;
 	@wm m_ea
 
 dd72	# LD   (IX+o),D
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = D;
 	@wm m_ea
 
 dd73	# LD   (IX+o),E
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = E;
 	@wm m_ea
 
 dd74	# LD   (IX+o),H
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = H;
 	@wm m_ea
 
 dd75	# LD   (IX+o),L
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = L;
 	@wm m_ea
 
@@ -3746,7 +3806,8 @@ dd76	# DB   DD
 
 dd77	# LD   (IX+o),A
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = A;
 	@wm m_ea
 
@@ -3774,7 +3835,8 @@ dd7d	# LD   A,LX
 
 dd7e	# LD   A,(IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	A = TDAT8;
 
@@ -3806,7 +3868,8 @@ dd85	# ADD  A,LX
 
 dd86	# ADD  A,(IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	add_a(TDAT8);
 
@@ -3838,7 +3901,8 @@ dd8d	# ADC  A,LX
 
 dd8e	# ADC  A,(IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	adc_a(TDAT8);
 
@@ -3870,7 +3934,8 @@ dd95	# SUB  LX
 
 dd96	# SUB  (IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	sub_a(TDAT8);
 
@@ -3902,7 +3967,8 @@ dd9d	# SBC  A,LX
 
 dd9e	# SBC  A,(IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	sbc_a(TDAT8);
 
@@ -3934,7 +4000,8 @@ dda5	# AND  LX
 
 dda6	# AND  (IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	and_a(TDAT8);
 
@@ -3966,7 +4033,8 @@ ddad	# XOR  LX
 
 ddae	# XOR  (IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	xor_a(TDAT8);
 
@@ -3998,7 +4066,8 @@ ddb5	# OR   LX
 
 ddb6	# OR   (IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	or_a(TDAT8);
 
@@ -4030,7 +4099,8 @@ ddbd	# CP   LX
 
 ddbe	# CP   (IX+o)
 	@eax
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	cp(TDAT8);
 
@@ -4085,8 +4155,16 @@ ddca	# DB   DD
 ddcb	# **   DD CB xx
 	@eax
 	@arg
-	2 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@jump_prefixed 0xfe
+
+z80n:ddcb	# **   DD CB xx
+	@eax
+	@arg
+	m_turbo_op = m_turbo && turbo_opcode(0xddcb00 | TDAT8);
+	@nomreq_addr_turbo 2, PC-1
+	m_ref = (0xfe << 16) | (TDAT8 << 8);
+	goto process;
 
 ddcc	# DB   DD
 	illegal_1();
@@ -4266,7 +4344,7 @@ ddf8	# DB   DD
 	@jump 00f8
 
 ddf9	# LD   SP,IX
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	SP = IX;
 
 ddfa	# DB   DD
@@ -4437,7 +4515,7 @@ fd22	# LD   (w),IY
 	WZ = m_ea + 1;
 
 fd23	# INC  IY
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	IY++;
 
 fd24	# INC  HY
@@ -4468,7 +4546,7 @@ fd2a	# LD   IY,(w)
 	WZ = m_ea + 1;
 
 fd2b	# DEC  IY
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	IY--;
 
 fd2c	# INC  LY
@@ -4503,14 +4581,16 @@ fd33	# DB   FD
 
 fd34	# INC  (IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm_reg m_ea
 	inc(TDAT8);
 	@wm m_ea
 
 fd35	# DEC  (IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm_reg m_ea
 	dec(TDAT8);
 	@wm m_ea
@@ -4518,7 +4598,7 @@ fd35	# DEC  (IY+o)
 fd36	# LD   (IY+o),n
 	@eay
 	@arg
-	2 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@wm m_ea
 
 fd37	# DB   FD
@@ -4580,7 +4660,8 @@ fd45	# LD   B,LY
 
 fd46	# LD   B,(IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	B = TDAT8;
 
@@ -4612,7 +4693,8 @@ fd4d	# LD   C,LY
 
 fd4e	# LD   C,(IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	C = TDAT8;
 
@@ -4644,7 +4726,8 @@ fd55	# LD   D,LY
 
 fd56	# LD   D,(IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	D = TDAT8;
 
@@ -4676,7 +4759,8 @@ fd5d	# LD   E,LY
 
 fd5e	# LD   E,(IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	E = TDAT8;
 
@@ -4703,7 +4787,8 @@ fd65	# LD   HY,LY
 
 fd66	# LD   H,(IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	H = TDAT8;
 
@@ -4729,7 +4814,8 @@ fd6d	# LD   LY,LY
 
 fd6e	# LD   L,(IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	L = TDAT8;
 
@@ -4738,37 +4824,43 @@ fd6f	# LD   LY,A
 
 fd70	# LD   (IY+o),B
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = B;
 	@wm m_ea
 
 fd71	# LD   (IY+o),C
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = C;
 	@wm m_ea
 
 fd72	# LD   (IY+o),D
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = D;
 	@wm m_ea
 
 fd73	# LD   (IY+o),E
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = E;
 	@wm m_ea
 
 fd74	# LD   (IY+o),H
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = H;
 	@wm m_ea
 
 fd75	# LD   (IY+o),L
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = L;
 	@wm m_ea
 
@@ -4778,7 +4870,8 @@ fd76	# DB   FD
 
 fd77	# LD   (IY+o),A
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	TDAT8 = A;
 	@wm m_ea
 
@@ -4806,7 +4899,8 @@ fd7d	# LD   A,LY
 
 fd7e	# LD   A,(IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	A = TDAT8;
 
@@ -4838,7 +4932,8 @@ fd85	# ADD  A,LY
 
 fd86	# ADD  A,(IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	add_a(TDAT8);
 
@@ -4870,7 +4965,8 @@ fd8d	# ADC  A,LY
 
 fd8e	# ADC  A,(IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	adc_a(TDAT8);
 
@@ -4902,7 +4998,8 @@ fd95	# SUB  LY
 
 fd96	# SUB  (IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	sub_a(TDAT8);
 
@@ -4934,7 +5031,8 @@ fd9d	# SBC  A,LY
 
 fd9e	# SBC  A,(IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	sbc_a(TDAT8);
 
@@ -4966,7 +5064,8 @@ fda5	# AND  LY
 
 fda6	# AND  (IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	and_a(TDAT8);
 
@@ -4998,7 +5097,8 @@ fdad	# XOR  LY
 
 fdae	# XOR  (IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	xor_a(TDAT8);
 
@@ -5030,7 +5130,8 @@ fdb5	# OR   LY
 
 fdb6	# OR   (IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	or_a(TDAT8);
 
@@ -5062,7 +5163,8 @@ fdbd	# CP   LY
 
 fdbe	# CP   (IY+o)
 	@eay
-	5 * @nomreq_addr PC-1
+	3 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@rm m_ea
 	cp(TDAT8);
 
@@ -5117,8 +5219,16 @@ fdca	# DB   FD
 fdcb	# **   FD CB xx
 	@eay
 	@arg
-	2 * @nomreq_addr PC-1
+	@nomreq_addr_turbo 2, PC-1
 	@jump_prefixed 0xfe
+
+z80n:fdcb	# **   FD CB xx
+	@eay
+	@arg
+	m_turbo_op = m_turbo && turbo_opcode(0xfdcb00 | TDAT8);
+	@nomreq_addr_turbo 2, PC-1
+	m_ref = (0xfe << 16) | (TDAT8 << 8);
+	goto process;
 
 fdcc	# DB   FD
 	illegal_1();
@@ -5298,7 +5408,7 @@ fdf8	# DB   FD
 	@jump 00f8
 
 fdf9	# LD   SP,IY
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	SP = IY;
 
 fdfa	# DB   FD
@@ -6224,7 +6334,7 @@ edff	# DB   ED
 	WZ_H = A;
 
 0003	# INC  BC
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	BC++;
 
 0004	# INC  B
@@ -6255,7 +6365,7 @@ edff	# DB   ED
 	WZ = BC+1;
 
 000b	# DEC  BC
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	BC--;
 
 000c	# INC  C
@@ -6272,7 +6382,7 @@ edff	# DB   ED
 	rrca();
 
 0010	# DJNZ o
-	@nomreq_ir 1
+	@nomreq_ir_turbo 1
 	@jr_cond --B
 
 0011	# LD   DE,w
@@ -6285,7 +6395,7 @@ edff	# DB   ED
 	WZ_H = A;
 
 0013	# INC  DE
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	DE++;
 
 0014	# INC  D
@@ -6313,7 +6423,7 @@ edff	# DB   ED
 	WZ = DE + 1;
 
 001b	# DEC  DE
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	DE--;
 
 001c	# INC  E
@@ -6342,7 +6452,7 @@ edff	# DB   ED
 	WZ = m_ea + 1;
 
 0023	# INC  HL
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	HL++;
 
 0024	# INC  H
@@ -6371,7 +6481,7 @@ edff	# DB   ED
 	WZ = m_ea + 1;
 
 002b	# DEC  HL
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	HL--;
 
 002c	# INC  L
@@ -7069,7 +7179,7 @@ edff	# DB   ED
 	@ret_cond m_f.s()
 
 00f9	# LD   SP,HL
-	@nomreq_ir 2
+	@nomreq_ir_turbo 2
 	SP = HL;
 
 00fa	# JP   M,a
@@ -8943,8 +9053,15 @@ macro   ldix
 	if (TDAT8 != A) {
 		@wm DE
 		;
+	} else {
+		// the skipped write keeps its cycles
+		+ m_mreq_cycles
+		;
 	}
-	+ 2
+	if (!m_turbo_op) {
+		+ 2
+		;
+	}
 	HL++;
 	DE++;
 	BC--;
@@ -8956,8 +9073,15 @@ macro   lddx
 	if (TDAT8 != A) {
 		@wm DE
 		;
+	} else {
+		// the skipped write keeps its cycles
+		+ m_mreq_cycles
+		;
 	}
-	+ 2
+	if (!m_turbo_op) {
+		+ 2
+		;
+	}
 	DE++;
 	HL--;
 	BC--;
@@ -9031,7 +9155,10 @@ z80n:ed90	# outinb
 	@rm HL
 	@out BC
 	HL++;
-	+ 1
+	if (!m_turbo_op) {
+		+ 1
+		;
+	}
 
 z80n:ed91	# nextreg *,*
 	@arg16 TDAT
@@ -9087,7 +9214,11 @@ z80n:edac	# lddx
 z80n:edb4	# ldirx
 	@ldix
 	if (BC != 0) {
-		+ 5
+		+ 3
+		if (!m_turbo_op) {
+			+ 2
+			;
+		}
 		PC -= 2;
 	}
 
@@ -9096,7 +9227,12 @@ z80n:edb7	# ldpirx
 	if (TDAT8 != A) {
 		@wm DE
 		;
+	} else {
+		// the skipped write keeps its cycles
+		+ m_mreq_cycles
+		;
 	}
+	+ 2
 	DE++;
 	BC--;
 	if (BC != 0) {
@@ -9107,6 +9243,10 @@ z80n:edb7	# ldpirx
 z80n:edbc	# lddrx
 	@lddx
 	if (BC != 0) {
-		+ 5
+		+ 3
+		if (!m_turbo_op) {
+			+ 2
+			;
+		}
 		PC -= 2;
 	}

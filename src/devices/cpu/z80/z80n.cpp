@@ -10,6 +10,9 @@
 
 #include "z80.inc"
 
+#include <algorithm>
+#include <iterator>
+
 #define LOG_INT   (1U << 1) // z80.lst
 
 //#define VERBOSE (LOG_INT)
@@ -29,7 +32,68 @@ z80n_device::z80n_device(const machine_config &mconfig, const char *tag, device_
 	, m_in_nextreg_cb(*this, 0)
 	, m_out_nextreg_cb(*this)
 	, m_core_30303(false)
+	, m_turbo(false)
+	, m_turbo_op(false)
 {
+}
+
+// Opcodes that turbo mode shortens: prefix bytes, then the opcode.
+// DD CB d op is 0xddcbNN. Sorted, for binary search. Every other opcode
+// keeps standard timing in turbo mode.
+static constexpr u32 TURBO_OPCODES[] =
+{
+	0x0010, // DJNZ e
+	0x0018, // JR e
+	0x0019, // ADD HL,DE
+	0x0023, // INC HL
+	0x002b, // DEC HL
+	0x0034, // INC (HL)
+	0x00cd, // CALL nn
+	0x00e3, // EX (SP),HL
+	0x00f9, // LD SP,HL
+	0xcb06, // RLC (HL)
+	0xcb3e, // SRL (HL)
+	0xcb46, // BIT 0,(HL)
+	0xcbc6, // SET 0,(HL)
+	0xdd19, // ADD IX,DE
+	0xdd23, // INC IX
+	0xdd34, // INC (IX+d)
+	0xdd36, // LD (IX+d),n
+	0xdd77, // LD (IX+d),A
+	0xdd7e, // LD A,(IX+d)
+	0xdd86, // ADD A,(IX+d)
+	0xdde3, // EX (SP),IX
+	0xddf9, // LD SP,IX
+	0xed47, // LD I,A
+	0xed52, // SBC HL,DE
+	0xed57, // LD A,I
+	0xed5a, // ADC HL,DE
+	0xed5f, // LD A,R
+	0xed67, // RRD
+	0xed6f, // RLD
+	0xed90, // OUTINB
+	0xeda0, // LDI
+	0xeda1, // CPI
+	0xeda2, // INI
+	0xeda3, // OUTI
+	0xeda4, // LDIX
+	0xeda8, // LDD
+	0xedac, // LDDX
+	0xedb0, // LDIR
+	0xedb1, // CPIR
+	0xedb2, // INIR
+	0xedb3, // OTIR
+	0xedb4, // LDIRX
+	0xedb8, // LDDR
+	0xedbc, // LDDRX
+	0xddcb06, // RLC (IX+d)
+	0xddcb46, // BIT 0,(IX+d)
+	0xddcbc6, // SET 0,(IX+d)
+};
+
+bool z80n_device::turbo_opcode(u32 opcode)
+{
+	return std::binary_search(std::begin(TURBO_OPCODES), std::end(TURBO_OPCODES), opcode);
 }
 
 void z80n_device::execute_run()
@@ -130,6 +194,8 @@ void z80n_device::device_start()
 	save_item(NAME(m_stackless));
 	save_item(NAME(m_stackless_retn_en));
 	save_item(NAME(m_core_30303));
+	save_item(NAME(m_turbo));
+	save_item(NAME(m_turbo_op));
 }
 
 void z80n_device::device_reset()

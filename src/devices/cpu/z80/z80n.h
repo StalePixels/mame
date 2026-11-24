@@ -24,6 +24,12 @@ public:
 	// Core 3.03.03 changed the Z80N: it adds NEXTREG A,n (ED C7)
 	void core_30303_w(bool data) { m_core_30303 = data; }
 
+	// Turbo mode (core 3.03.03, nextreg $07 bit 2 at 28MHz) leaves out most
+	// of the internal cycles that standard Z80 timing adds. Memory, I/O and
+	// nextreg cycles keep their length. Only the opcodes in TURBO_OPCODES
+	// (z80n.cpp) get turbo timing.
+	void turbo_w(bool data) { m_turbo = data; }
+
 	// T80N debug interface (FPGA cpu/readme.txt): one byte of CPU state by
 	// register id 0x00-0x1f.  debug_reg_r only reads, so another thread may
 	// call it; it then sees the state at some point of the running
@@ -51,6 +57,10 @@ private:
 	bool m_stackless;
 	bool m_stackless_retn_en;
 	bool m_core_30303;
+	bool m_turbo;
+	bool m_turbo_op; // turbo timing for the instruction that runs now
+
+	static bool turbo_opcode(u32 opcode);
 
 };
 
